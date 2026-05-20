@@ -1,0 +1,161 @@
+<h2>部署拓扑 &amp; 实现路线</h2>
+<p class="subtitle">从开发到生产，分阶段交付</p>
+
+<div class="section">
+  <h3>1. 部署拓扑</h3>
+  <div class="mockup">
+    <div class="mockup-header">开发环境：stdio 子进程模式</div>
+    <div class="mockup-body" style="font-family:monospace;font-size:0.72em;padding:16px;line-height:1.7">
+<pre style="margin:0;background:none;border:none;padding:0">
+┌──────────────────────────────────────────┐
+│         Sherpa Pod / 开发机               │
+│                                          │
+│  ┌─────────┐    MCP stdio    ┌─────────┐ │
+│  │ Sherpa   │◄──────────────►│ GBrain  │ │
+│  │ workflow │  JSON-RPC      │ serve   │ │
+│  │ graph    │  (子进程)       │         │ │
+│  └────┬─────┘                └────┬────┘ │
+│       │                           │      │
+│  ┌────┴─────┐              ┌──────┴────┐ │
+│  │ Sherpa   │              │  GBrain   │ │
+│  │ Postgres │              │  PGLite   │ │
+│  │          │              │  (嵌入式)  │ │
+│  └──────────┘              └───────────┘ │
+└──────────────────────────────────────────┘
+
+  MemoryAdapter.__init__: 启动 gbrain serve 子进程
+  GBrain 数据库: PGLite（零配置，数据在 ~/.gbrain/）
+</pre>
+    </div>
+  </div>
+
+  <div class="mockup" style="margin-top:16px">
+    <div class="mockup-header">生产环境：K8s Sidecar 模式</div>
+    <div class="mockup-body" style="font-family:monospace;font-size:0.72em;padding:16px;line-height:1.7">
+<pre style="margin:0;background:none;border:none;padding:0">
+┌──────────────────────────────────────────────┐
+│              Kubernetes Pod                   │
+│                                              │
+│  ┌──────────────┐    MCP stdio   ┌─────────┐ │
+│  │ Sherpa Job   │◄──────────────►│ GBrain  │ │
+│  │ Container    │   localhost    │ Sidecar │ │
+│  │ (Python)     │                │ (Bun)   │ │
+│  └──────┬───────┘                └────┬────┘ │
+│         │                             │      │
+└─────────┼─────────────────────────────┼──────┘
+          │                             │
+    ┌─────┴──────┐             ┌────────┴──────┐
+    │  Sherpa    │             │  GBrain       │
+    │  Postgres  │             │  Postgres     │
+    │  (控制面DB) │             │  + pgvector   │
+    └────────────┘             │  (记忆DB)     │
+                               └───────────────┘
+
+  GBrain 从 PGLite 迁移到 Postgres + pgvector
+  共享 Pod 内的 localhost 通信，零网络延迟
+  两张数据库独立，可分别备份/扩缩容
+</pre>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>2. 分阶段实现路线</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="font-size:0.85em;padding:16px">
+
+      <div style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:12px;margin:12px 0">
+        <span class="label" style="color:#22c55e">Phase 1 — 核心读写通路（1-2 周）</span>
+        <ul style="margin:8px 0 0 0;font-size:0.9em">
+          <li>MemoryAdapter 基础实现（MCP client + 核心方法）</li>
+          <li>crash-triage / crash-analysis 节点的实时写入</li>
+          <li>plan 节点的查询（get_target_profile）</li>
+          <li>开发环境 PGLite，stdio 子进程模式</li>
+          <li><strong>验证方式：</strong>跑完一次完整 fuzz 会话，确认 GBrain 中有 session + crash 记录</li>
+        </ul>
+      </div>
+
+      <div style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:12px;margin:12px 0">
+        <span class="label" style="color:#f59e0b">Phase 2 — 经验总结节点 + 批量写入（1 周）</span>
+        <ul style="margin:8px 0 0 0;font-size:0.9em">
+          <li>实现 memory-summarize 工作流节点</li>
+          <li>batch_write 攒批机制 + 重试逻辑</li>
+          <li>coverage-analysis / build / run 阶段的批量写入</li>
+          <li>session 级 page 间 link 关系建立</li>
+          <li><strong>验证方式：</strong>多次 fuzz 后，GBrain 图谱中能遍历 session→crash→target 链路</li>
+        </ul>
+      </div>
+
+      <div style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:12px;margin:12px 0">
+        <span class="label" style="color:#3b82f6">Phase 3 — 主动建议机制（1 周）</span>
+        <ul style="margin:8px 0 0 0;font-size:0.9em">
+          <li>get_suggestions 实现（组合查询 + 结构化建议生成）</li>
+          <li>建议采纳/忽略的 timeline 记录</li>
+          <li>搜索阈值调优（避免无效建议）</li>
+          <li>GitNexus code_query 集成（代码级搜索）</li>
+          <li><strong>验证方式：</strong>第二次 fuzz 同一仓库时，plan 节点收到策略建议且建议有效</li>
+        </ul>
+      </div>
+
+      <div style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:12px;margin:12px 0">
+        <span class="label" style="color:#8b5cf6">Phase 4 — 生产化 + 进阶特性（持续）</span>
+        <ul style="margin:8px 0 0 0;font-size:0.9em">
+          <li>K8s sidecar 部署 + Postgres 迁移</li>
+          <li>跨仓库知识迁移（相似仓库的策略自动推荐）</li>
+          <li>策略效果自动评估（success_rate 动态更新）</li>
+          <li>GBrain doctor 定期维护集成</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>3. 文件结构规划</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="font-family:monospace;font-size:0.75em;padding:16px;line-height:1.7">
+<pre style="margin:0;background:none;border:none;padding:0">Sherpa 仓库中新增/修改的文件：
+
+<span style="color:var(--muted)"># 新增</span>
+harness_generator/src/langchain_agent/
+├── memory_adapter.py          <span style="color:var(--muted)"># MemoryAdapter 核心类</span>
+├── memory/
+│   ├── __init__.py
+│   ├── schemas.py             <span style="color:var(--muted)"># Page frontmatter 的 Python dataclass</span>
+│   ├── slug_resolver.py       <span style="color:var(--muted)"># repo_url → slug 的转换逻辑</span>
+│   └── suggestion_builder.py  <span style="color:var(--muted)"># 查询结果 → 结构化建议</span>
+└── nodes/
+    └── memory_summarize.py    <span style="color:var(--muted)"># 🆕 memory-summarize 工作流节点</span>
+
+<span style="color:var(--muted)"># 修改</span>
+harness_generator/src/langchain_agent/
+├── workflow_graph.py          <span style="color:var(--muted)"># 新增 memory-summarize 节点 + 建议钩子</span>
+└── opencode_skills/
+    ├── plan/                  <span style="color:var(--muted)"># 加入 get_suggestions 调用</span>
+    ├── crash_triage/          <span style="color:var(--muted)"># 加入 find_similar + 实时写入</span>
+    └── crash_analysis/        <span style="color:var(--muted)"># 加入 find_similar + 实时写入</span>
+</pre>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>4. 设计总结</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="font-size:0.85em;padding:16px">
+      <table style="width:100%;border-collapse:collapse">
+        <tr style="border-bottom:1px solid var(--border)">
+          <th style="text-align:left;padding:8px">决策项</th>
+          <th style="text-align:left;padding:8px">结论</th>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px">集成模式</td><td style="padding:8px">A. Memory Sidecar — MCP 独立服务</td></tr>
+        <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px">读写策略</td><td style="padding:8px">关键阶段同步实时写，其余会话结束批量写</td></tr>
+        <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px">经验提炼</td><td style="padding:8px">独立 memory-summarize 节点，会话后运行</td></tr>
+        <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px">经验回馈</td><td style="padding:8px">节点进入时主动查询 + 结构化建议</td></tr>
+        <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px">数据模型</td><td style="padding:8px">5 种 page 类型 + 7 种关系边 + compiled_truth/timeline 结构</td></tr>
+        <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px">容错</td><td style="padding:8px">MCP 自动拉起、超时不阻塞、写入降级到本地日志</td></tr>
+        <tr style="border-bottom:1px solid var(--border)"><td style="padding:8px">部署路径</td><td style="padding:8px">开发 PGLite stdio → 生产 Postgres K8s Sidecar</td></tr>
+      </table>
+    </div>
+  </div>
+</div>

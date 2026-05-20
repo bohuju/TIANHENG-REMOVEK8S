@@ -1,0 +1,165 @@
+<h2>架构 v2：新增"经验总结节点" + "经验建议"机制</h2>
+<p class="subtitle">GBrain 不仅是存储，更是 Sherpa 工作流中主动提供经验建议的参与者</p>
+
+<div class="section">
+  <h3>1. 工作流中新增 memory-summarize 节点</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="font-family:monospace;font-size:0.75em;line-height:1.8;padding:20px">
+<pre style="margin:0;background:none;border:none;padding:0">
+                        ┌──────────┐
+                        │   init   │
+                        └────┬─────┘
+                             │
+                        ┌────┴─────┐  ← 💡 建议: 查询 GBrain 中该仓库的历史 fuzz 经验
+                        │   plan   │
+                        └────┬─────┘
+                             │
+                        ┌────┴─────┐
+                        │synthesize│
+                        └────┬─────┘
+                             │
+                        ┌────┴─────┐
+                        │  build   │
+                        └────┬─────┘
+                             │
+                        ┌────┴─────┐
+                        │   run    │
+                        └────┬─────┘
+                             │
+                    ┌────────┼────────┐
+                    │        │        │
+               ┌────┴───┐ ┌──┴───┐ ┌──┴──────────┐
+               │coverage│ │crash │ │crash-analysis│
+               │analysis│ │triage│ │              │
+               └────────┘ └──┬───┘ └──┬───────────┘
+                             │        │
+                             │   💡 建议查询相似崩溃
+                             │   💡 建议查询相似漏洞判定
+                             │
+                    会话是否结束？
+                         │
+                    ┌────┴──────────────────┐
+                    │                       │
+               ┌────┴───┐             ╔══════════════╗
+               │improve │             ║  memory-      ║ ← 🆕 独立节点
+               │harness │             ║  summarize    ║   会话结束后运行
+               └────────┘             ║  (经验总结)    ║
+                                      ╚══════╤═══════╝
+                                             │
+                                      主动提炼本次会话:
+                                      • 哪些 harness 模式有效
+                                      • 哪些 crash 是真实漏洞
+                                      • 覆盖率变化趋势
+                                      • 策略调整及其效果
+                                      • 写入 GBrain 并建立 page 间 link
+</pre>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>2. 经验建议机制 — 节点主动提议查询 GBrain</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="font-size:0.85em;padding:16px">
+      <p><strong>不再是被动等待调用，而是主动建议：</strong></p>
+
+      <div style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:12px;margin:12px 0">
+        <span class="label">plan 节点进入时</span>
+        <p style="margin:4px 0">💡 MemoryAdapter 主动提示：</p>
+        <p style="margin:4px 0;color:var(--muted)">"检测到目标仓库 libxml2-v2.9.14，GBrain 中有 3 条相关记录：<br/>
+        &nbsp;&nbsp;• 上次 fuzz 覆盖率 62%，parser 模块是瓶颈<br/>
+        &nbsp;&nbsp;• 曾发现 2 个真实漏洞（CVE-2024-xxx, CVE-2025-xxx）<br/>
+        &nbsp;&nbsp;• 有效 harness 模式：dict-based + ASAN<br/>
+        是否参考这些经验？"</p>
+      </div>
+
+      <div style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:12px;margin:12px 0">
+        <span class="label">crash-triage 节点进入时</span>
+        <p style="margin:4px 0">💡 MemoryAdapter 主动提示：</p>
+        <p style="margin:4px 0;color:var(--muted)">"当前崩溃 SIGSEGV in xmlParseElement，GBrain 中有 2 次相似崩溃记录：<br/>
+        &nbsp;&nbsp;• 1 次确认为真实漏洞（use-after-free）<br/>
+        &nbsp;&nbsp;• 1 次确认为 harness 自身 bug<br/>
+        建议对比崩溃特征：调用栈深度、内存状态"</p>
+      </div>
+
+      <div style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:12px;margin:12px 0">
+        <span class="label">crash-analysis 节点进入时</span>
+        <p style="margin:4px 0">💡 MemoryAdapter 主动提示：</p>
+        <p style="margin:4px 0;color:var(--muted)">"相似漏洞判定记录：libxslt 中也出现过类似的解析器 UAF，<br/>
+        根因是 xmlFreeNode 后未置空指针。建议检查当前崩溃是否同类问题。"</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>3. memory-summarize 节点的职责</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="font-size:0.85em;padding:16px">
+      <table style="width:100%;border-collapse:collapse">
+        <tr style="border-bottom:1px solid var(--border)">
+          <th style="text-align:left;padding:8px">子步骤</th>
+          <th style="text-align:left;padding:8px">输入</th>
+          <th style="text-align:left;padding:8px">对 GBrain 的操作</th>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px">1. 聚合本会话所有阶段结果</td>
+          <td style="padding:8px;font-size:0.85em">plan 决策、harness 生成记录、构建结果、覆盖率时间线、crash 分诊/分析结论</td>
+          <td style="padding:8px">put_page: type=fuzz/session<br/>记录会话时间线</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px">2. 提炼有效策略模式</td>
+          <td style="padding:8px;font-size:0.85em">哪些 seed family 产出高、哪些 harness 结构编译通过率高</td>
+          <td style="padding:8px">put_page: type=fuzz/strategy<br/>add_link → target repo</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px">3. 归档崩溃结论</td>
+          <td style="padding:8px;font-size:0.85em">每个 crash 的最终判定（真实漏洞/误报/未确定）</td>
+          <td style="padding:8px">put_page: type=fuzz/crash<br/>add_link → session page</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px">4. 更新目标仓库画像</td>
+          <td style="padding:8px;font-size:0.85em">最新覆盖率、已发现攻击面、推荐策略</td>
+          <td style="padding:8px">get_page → 更新 compiled_truth<br/>add_timeline_entry</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px">5. 建立跨页面关系</td>
+          <td style="padding:8px;font-size:0.85em">session → target repo → crash pages → strategy pages</td>
+          <td style="padding:8px">add_link batch<br/>形成知识图谱</td>
+        </tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>4. MemoryAdapter 的主动建议逻辑</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="font-size:0.85em;padding:16px">
+      <p><strong>每个需要经验的节点进入时，MemoryAdapter 执行：</strong></p>
+      <ol style="line-height:2">
+        <li><strong>查询</strong>：根据当前节点上下文（目标仓库、崩溃签名、阶段类型）构造查询，调 GBrain hybrid search</li>
+        <li><strong>判断相关性</strong>：如果返回结果的 score 超过阈值 → 生成建议提示</li>
+        <li><strong>呈现建议</strong>：将历史经验以结构化建议形式呈现给节点，节点决定是否采纳</li>
+        <li><strong>记录采纳/忽略</strong>：无论节点是否采纳，建议本身作为 timeline entry 写入，形成决策轨迹</li>
+      </ol>
+
+      <div class="pros-cons" style="margin-top:16px">
+        <div class="pros"><h4>有建议的节点</h4>
+          <ul>
+            <li>plan — 查询同类仓库 fuzz 策略</li>
+            <li>crash-triage — 查询相似崩溃分类</li>
+            <li>crash-analysis — 查询相似漏洞根因</li>
+            <li>coverage-analysis — 查询历史覆盖率改进路径</li>
+          </ul>
+        </div>
+        <div class="cons"><h4>无建议的节点</h4>
+          <ul>
+            <li>init / synthesize / build / run — 执行确定性操作，不查 GBrain</li>
+            <li>improve-harness / fix-harness — 局部的代码修改，不需要经验</li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

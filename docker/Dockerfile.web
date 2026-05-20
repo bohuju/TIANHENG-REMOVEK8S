@@ -1,0 +1,232 @@
+ARG WEB_PYTHON_BASE_IMAGE=python:3.10-slim
+FROM ${WEB_PYTHON_BASE_IMAGE}
+
+ENV PYTHONUNBUFFERED=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple" \
+    PIP_TRUSTED_HOST="pypi.tuna.tsinghua.edu.cn" \
+    NPM_CONFIG_REGISTRY="https://registry.npmmirror.com" \
+    DEBIAN_FRONTEND=noninteractive
+
+WORKDIR /app
+
+# Use CN mirrors by default (override with build args if needed).
+ARG APT_MIRROR="http://mirrors.tuna.tsinghua.edu.cn/debian"
+ARG APT_SECURITY_MIRROR="http://mirrors.tuna.tsinghua.edu.cn/debian-security"
+
+# Best-effort: rewrite Debian apt sources to CN mirrors.
+RUN set -e; \
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do \
+      [ -f "$f" ] || continue; \
+      sed -i -E "s#https?://deb.debian.org/debian#${APT_MIRROR}#g" "$f"; \
+      sed -i -E "s#https?://security.debian.org/debian-security#${APT_SECURITY_MIRROR}#g" "$f"; \
+      sed -i -E "s#https?://security.debian.org/debian#${APT_SECURITY_MIRROR}#g" "$f"; \
+    done
+
+# System deps:
+# - build toolchain for in-worker compile/run
+# - git/curl/ca-certificates helpers
+# - vim-common provides xxd (nice-to-have)
+RUN apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        make \
+        g++ \
+        clang \
+        cmake \
+        ninja-build \
+        pkg-config \
+    autoconf \
+    automake \
+    libtool \
+    m4 \
+    gettext \
+    bison \
+    flex \
+    gawk \
+        postgresql-client \
+        ripgrep \
+        libfuzzer-19-dev \
+        libclang-rt-19-dev \
+        vim-common \
+        unzip \
+        zip \
+        xz-utils \
+        llvm-dev \
+        libclang-dev \
+        zlib1g-dev \
+        nlohmann-json3-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+    # Seed a local vcpkg template for repo-local bootstrap (repo/vcpkg at runtime).
+    ARG VCPKG_TEMPLATE_REF=master
+    RUN set -e; \
+      rm -rf /opt/vcpkg-template; \
+      git clone --depth 1 --branch "$VCPKG_TEMPLATE_REF" https://github.com/microsoft/vcpkg /opt/vcpkg-template; \
+      /opt/vcpkg-template/bootstrap-vcpkg.sh -disableMetrics
+
+ARG RADAMSA_VERSION="0.7"
+RUN set -e; \
+    if apt-get update -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+       && apt-get install -y --no-install-recommends radamsa; then \
+      command -v radamsa >/dev/null; \
+      rm -rf /var/lib/apt/lists/*; \
+      exit 0; \
+    fi; \
+    echo "[warn] apt radamsa install failed, building from source"; \
+    rm -rf /var/lib/apt/lists/*; \
+    workdir="$(mktemp -d)"; \
+    curl --retry 5 --retry-delay 2 --retry-all-errors --connect-timeout 10 --max-time 180 \
+      -fsSL "https://gitlab.com/akihe/radamsa/-/archive/v${RADAMSA_VERSION}/radamsa-v${RADAMSA_VERSION}.tar.gz" \
+      -o "${workdir}/radamsa.tar.gz"; \
+    tar -xzf "${workdir}/radamsa.tar.gz" -C "${workdir}"; \
+    cd "${workdir}/radamsa-v${RADAMSA_VERSION}"; \
+    make; \
+    install -m 0755 bin/radamsa /usr/local/bin/radamsa; \
+    cd /; \
+    rm -rf "${workdir}"; \
+    command -v radamsa >/dev/null
+
+# Toolchain smoke check: fail image build early if fuzz sanitizer runtime is incomplete.
+RUN set -e; \
+    command -v clang++ >/dev/null; \
+    command -v cmake >/dev/null; \
+    command -v ninja >/dev/null; \
+    command -v pkg-config >/dev/null; \
+  command -v aclocal >/dev/null; \
+  command -v autoconf >/dev/null; \
+  command -v autoreconf >/dev/null; \
+  command -v automake >/dev/null; \
+  command -v libtoolize >/dev/null; \
+  command -v m4 >/dev/null; \
+  command -v bison >/dev/null; \
+  command -v flex >/dev/null; \
+    resource_dir="$(clang++ -print-resource-dir)"; \
+    test -n "$resource_dir"; \
+    find "$resource_dir/lib" -type f -name 'libclang_rt.fuzzer*.a' | grep -q .; \
+    find "$resource_dir/lib" -type f -name 'libclang_rt.ubsan_standalone*.a' | grep -q .; \
+    printf '%s\n' \
+      'extern "C" int LLVMFuzzerTestOneInput(const unsigned char* data, unsigned long size) {' \
+      '  (void)data; (void)size;' \
+      '  return 0;' \
+      '}' > /tmp/fuzz_smoke.cc
+RUN set -e; \
+    clang++ -std=c++17 -O1 -g -fsanitize=fuzzer,address,undefined /tmp/fuzz_smoke.cc -o /tmp/fuzz_smoke; \
+    /tmp/fuzz_smoke -runs=1 || true; \
+    rm -f /tmp/fuzz_smoke.cc /tmp/fuzz_smoke
+
+# Install Docker CLI (needed to communicate with dind sidecar via DOCKER_HOST).
+ARG DOCKER_VERSION=27.5.1
+RUN set -e; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "$arch" in \
+        amd64|x86_64) docker_arch="x86_64" ;; \
+        arm64|aarch64) docker_arch="aarch64" ;; \
+        *) echo "Unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    for url in \
+      "https://mirrors.tuna.tsinghua.edu.cn/docker-ce/linux/static/stable/${docker_arch}/docker-${DOCKER_VERSION}.tgz" \
+      "https://download.docker.com/linux/static/stable/${docker_arch}/docker-${DOCKER_VERSION}.tgz"; \
+    do \
+      echo "[docker-cli] downloading from $url"; \
+      if curl --retry 3 --retry-delay 2 --connect-timeout 10 --max-time 180 -fsSL "$url" -o /tmp/docker.tgz 2>/dev/null; then \
+        break; \
+      fi; \
+    done; \
+    test -s /tmp/docker.tgz || { echo "Failed to download Docker CLI" >&2; exit 1; }; \
+    tar -xzf /tmp/docker.tgz -C /usr/local/bin --strip-components=1 docker/docker; \
+    rm -f /tmp/docker.tgz; \
+    chmod +x /usr/local/bin/docker; \
+    docker --version
+
+COPY docker/requirements.web.txt /app/docker/requirements.web.txt
+RUN python -m pip install -r /app/docker/requirements.web.txt
+
+COPY . /app
+RUN python -m pip install -e /app/promefuzz-mcp
+RUN set -e; \
+    cd /app/promefuzz-mcp; \
+    python -m promefuzz_mcp.server build; \
+    test -x /app/promefuzz-mcp/processor/build/bin/preprocessor; \
+    test -x /app/promefuzz-mcp/processor/build/bin/cgprocessor
+
+RUN set -e; \
+    groupadd --system --gid 10001 sherpa; \
+    useradd --system --uid 10001 --gid 10001 --create-home --home-dir /home/sherpa sherpa; \
+    mkdir -p /app/job-logs /shared/tmp /shared/output /shared/oss-fuzz; \
+    chown -R 10001:10001 /app /home/sherpa /shared/tmp /shared/output /shared/oss-fuzz
+
+# Optional: install OpenCode CLI. This requires network access during build.
+# If you cannot reach external package registries from your build environment, rebuild with:
+#   --build-arg INSTALL_OPENCODE=0
+ARG INSTALL_OPENCODE=1
+ARG NODE_VERSION="20.11.1"
+ARG NODE_MIRROR="https://npmmirror.com/mirrors/node"
+ARG NPM_REGISTRY_CANDIDATES="https://registry.npmmirror.com https://mirrors.cloud.tencent.com/npm https://mirrors.huaweicloud.com/repository/npm https://registry.npmjs.org"
+ARG TARGETARCH
+RUN if [ "$INSTALL_OPENCODE" = "1" ]; then \
+            echo "Installing Node.js (for CLI tools)..."; \
+            arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+            case "$arch" in \
+                amd64|x86_64) node_arch="x64" ;; \
+                arm64|aarch64) node_arch="arm64" ;; \
+                *) echo "Unsupported architecture for Node.js: $arch" >&2; exit 1 ;; \
+            esac; \
+            curl -fsSL "$NODE_MIRROR/v$NODE_VERSION/node-v$NODE_VERSION-linux-$node_arch.tar.xz" -o /tmp/node.tar.xz; \
+            tar -xJf /tmp/node.tar.xz -C /usr/local --strip-components=1; \
+            rm -f /tmp/node.tar.xz; \
+            npm --version; node --version; \
+        fi \
+    && if [ "$INSTALL_OPENCODE" = "1" ]; then \
+            echo "Installing OpenCode CLI..."; \
+            selected=""; \
+            for r in $NPM_REGISTRY_CANDIDATES; do \
+              echo "[npm] probing registry: $r"; \
+              if npm --fetch-timeout=12000 --loglevel=error --registry "$r" view lodash version >/dev/null 2>&1; then \
+                selected="$r"; \
+                echo "[npm] selected registry: $selected"; \
+                break; \
+              fi; \
+            done; \
+            if [ -z "$selected" ]; then \
+              selected="$NPM_CONFIG_REGISTRY"; \
+              echo "[npm] probe failed; fallback registry: $selected"; \
+            fi; \
+            npm config set registry "$selected"; \
+            npm config set fetch-retries 5; \
+            npm config set fetch-retry-factor 2; \
+            npm config set fetch-retry-mintimeout 2000; \
+            npm config set fetch-retry-maxtimeout 30000; \
+            npm config set fetch-timeout 180000; \
+            ok=0; \
+            for attempt in 1 2 3; do \
+              echo "[npm] installing opencode-ai (attempt $attempt/3)"; \
+              if npm i -g --loglevel=info opencode-ai; then \
+                ok=1; \
+                echo "[npm] installed opencode-ai"; \
+                break; \
+              fi; \
+              echo "[npm] failed to install opencode-ai on attempt $attempt/3"; \
+              sleep $((attempt * 2)); \
+            done; \
+            if [ "$ok" -ne 1 ]; then \
+              echo "[npm] failed to install opencode-ai after retries"; \
+              exit 1; \
+            fi; \
+            opencode --version || true; \
+        else \
+            echo "Skipping OpenCode CLI install"; \
+        fi
+
+# Run the FastAPI API backend from its folder so relative imports work.
+WORKDIR /app/harness_generator/src/langchain_agent
+
+ENV HOME=/home/sherpa
+USER 10001:10001
+
+EXPOSE 8001
+
+CMD ["python", "main.py"]

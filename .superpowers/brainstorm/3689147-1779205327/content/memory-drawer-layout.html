@@ -1,0 +1,72 @@
+<h2>记忆查看器 — 抽屉布局</h2>
+<p class="subtitle">MUI Drawer 从右侧滑出，内部分为三个区域</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">仪表盘主页（触发入口）</div>
+    <div class="mockup-body">
+      <div class="mock-nav">Sherpa 控制台 &nbsp;&nbsp;&nbsp; <button class="mock-button" style="margin-left:auto;background:#0f5ad8;color:white;border:none;padding:6px 16px;border-radius:6px;">🧠 记忆查看</button></div>
+      <div style="display:flex;gap:12px;padding:12px;">
+        <div style="flex:1;">
+          <div class="placeholder" style="height:80px;">SystemOverviewCard</div>
+          <div class="placeholder" style="height:200px;margin-top:12px;">TaskProgressPanel</div>
+        </div>
+        <div style="width:300px;">
+          <div class="placeholder" style="height:120px;">ConfigPanel</div>
+          <div class="placeholder" style="height:120px;margin-top:12px;">SessionPanel</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup">
+    <div class="mockup-header">抽屉展开（占屏幕 40% 宽度）</div>
+    <div class="mockup-body" style="display:flex;flex-direction:column;gap:12px;">
+      <!-- Search bar -->
+      <div style="display:flex;align-items:center;gap:8px;padding:8px 0;">
+        <input class="mock-input" style="flex:1;" placeholder="🔍 搜索记忆关键词...">
+        <button class="mock-button" style="background:#0f5ad8;color:white;border:none;padding:6px 14px;border-radius:6px;">搜索</button>
+      </div>
+
+      <!-- Type tabs -->
+      <div style="display:flex;gap:4px;flex-wrap:wrap;font-size:13px;">
+        <span style="background:#0f5ad8;color:white;padding:4px 12px;border-radius:14px;">全部</span>
+        <span style="background:#e8eaf0;padding:4px 12px;border-radius:14px;">🎯 目标仓库</span>
+        <span style="background:#e8eaf0;padding:4px 12px;border-radius:14px;">📋 Session</span>
+        <span style="background:#e8eaf0;padding:4px 12px;border-radius:14px;">💥 Crash</span>
+        <span style="background:#e8eaf0;padding:4px 12px;border-radius:14px;">📐 策略</span>
+        <span style="background:#e8eaf0;padding:4px 12px;border-radius:14px;">🔧 Harness</span>
+      </div>
+
+      <!-- Results list -->
+      <div style="display:flex;flex-direction:column;gap:8px;">
+        <div style="border:1px solid #e0e0e0;border-radius:8px;padding:10px 12px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <strong style="font-size:14px;">GNOME/libxml2</strong>
+            <span style="font-size:11px;background:#e3f2fd;color:#0f5ad8;padding:2px 8px;border-radius:10px;">🎯 目标仓库</span>
+          </div>
+          <p style="font-size:12px;color:#666;margin:4px 0;">C fuzzing target, 12 sessions, 3 true vulns found...</p>
+          <div style="font-size:11px;color:#999;">fuzz/targets/GNOME-libxml2 &nbsp;|&nbsp; 相关度 0.95</div>
+        </div>
+
+        <div style="border:1px solid #e0e0e0;border-radius:8px;padding:10px 12px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <strong style="font-size:14px;">libxml2-sess-a1b2c3</strong>
+            <span style="font-size:11px;background:#e8f5e9;color:#2e7d32;padding:2px 8px;border-radius:10px;">📋 Session</span>
+          </div>
+          <p style="font-size:12px;color:#666;margin:4px 0;">Duration: 45min, 3 harnesses, 2 crashes, coverage 68%→82%</p>
+          <div style="font-size:11px;color:#999;">fuzz/sessions/libxml2-a1b2c3 &nbsp;|&nbsp; 相关度 0.82</div>
+        </div>
+
+        <div style="border:1px solid #e0e0e0;border-radius:8px;padding:10px 12px;">
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <strong style="font-size:14px;">heap-buffer-overflow-xmlParse</strong>
+            <span style="font-size:11px;background:#fce4ec;color:#c62828;padding:2px 8px;border-radius:10px;">💥 Crash</span>
+          </div>
+          <p style="font-size:12px;color:#666;margin:4px 0;">True positive, high severity, CVE-2024-xxxxx</p>
+          <div style="font-size:11px;color:#999;">fuzz/crashes/libxml2-crash001 &nbsp;|&nbsp; 相关度 0.71</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

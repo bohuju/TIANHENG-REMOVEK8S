@@ -1,0 +1,582 @@
+from __future__ import annotations
+
+import json
+import os
+import re
+import time
+from pathlib import Path
+from typing import Any
+
+from workflow_common import collect_key_artifact_hashes
+
+
+def detect_harness_error(repo_root: Path) -> bool:
+    analysis_path = repo_root / "crash_analysis.md"
+    if not analysis_path.is_file():
+        return False
+    try:
+        text = analysis_path.read_text(encoding="utf-8", errors="ignore")
+    except Exception:
+        return False
+    return bool(re.search(r"HARNESS ERROR", text, re.IGNORECASE))
+
+
+def bytes_human(num_bytes: int) -> str:
+    n = max(0, int(num_bytes))
+    units = ["B", "KB", "MB", "GB"]
+    idx = 0
+    val = float(n)
+    while val >= 1024.0 and idx < len(units) - 1:
+        val /= 1024.0
+        idx += 1
+    if idx == 0:
+        return f"{int(val)}{units[idx]}"
+    return f"{val:.1f}{units[idx]}"
+
+
+def tree_file_stats(root: Path) -> tuple[int, int]:
+    files = 0
+    total_bytes = 0
+    if not root.is_dir():
+        return files, total_bytes
+    for p in root.rglob("*"):
+        if not p.is_file():
+            continue
+        files += 1
+        try:
+            total_bytes += int(p.stat().st_size)
+        except Exception:
+            pass
+    return files, total_bytes
+
+
+def collect_fuzz_inventory(repo_root: Path) -> dict[str, Any]:
+    fuzz_dir = repo_root / "fuzz"
+    out_dir = fuzz_dir / "out"
+    corpus_dir = fuzz_dir / "corpus"
+    artifacts_dir = out_dir / "artifacts"
+
+    binaries: list[str] = []
+    options_files: list[str] = []
+    if out_dir.is_dir():
+        for p in sorted(out_dir.iterdir()):
+            if not p.is_file():
+                continue
+            name = p.name
+            if name.endswith(".options"):
+                options_files.append(name)
+            if os.access(p, os.X_OK) or p.suffix.lower() == ".exe":
+                binaries.append(name)
+
+    artifact_files: list[str] = []
+    if artifacts_dir.is_dir():
+        for p in sorted(artifacts_dir.rglob("*")):
+            if p.is_file():
+                artifact_files.append(str(p.relative_to(repo_root)))
+
+    corpus_stats: dict[str, dict[str, Any]] = {}
+    corpus_total_files = 0
+    corpus_total_bytes = 0
+    if corpus_dir.is_dir():
+        for d in sorted(corpus_dir.iterdir()):
+            if not d.is_dir():
+                continue
+            files, size_bytes = tree_file_stats(d)
+            corpus_total_files += files
+            corpus_total_bytes += size_bytes
+            corpus_stats[d.name] = {
+                "files": files,
+                "bytes": size_bytes,
+                "human": bytes_human(size_bytes),
+            }
+
+    return {
+        "fuzz_dir": str(fuzz_dir),
+        "fuzz_out_dir": str(out_dir),
+        "fuzz_corpus_dir": str(corpus_dir),
+        "fuzzer_binaries": binaries,
+        "fuzzer_count": len(binaries),
+        "options_files": options_files,
+        "artifact_files": artifact_files,
+        "artifact_count": len(artifact_files),
+        "corpus_stats": corpus_stats,
+        "corpus_total_files": corpus_total_files,
+        "corpus_total_bytes": corpus_total_bytes,
+        "corpus_total_human": bytes_human(corpus_total_bytes),
+    }
+
+
+def _build_fuzz_performance(run_details: list[dict[str, Any]], out: dict[str, Any]) -> dict[str, Any]:
+    """Build per-fuzzer performance metrics for the run summary JSON."""
+    fuzzers: dict[str, dict[str, Any]] = {}
+    for detail in (run_details or []):
+        name = str(detail.get("fuzzer") or "unknown")
+        fuzzers[name] = {
+            "final_cov": int(detail.get("final_cov") or 0),
+            "final_ft": int(detail.get("final_ft") or 0),
+            "final_execs_per_sec": int(detail.get("final_execs_per_sec") or 0),
+            "final_iteration": int(detail.get("final_iteration") or 0),
+            "final_rss_mb": int(detail.get("final_rss_mb") or 0),
+            "final_corpus_files": int(detail.get("final_corpus_files") or 0),
+            "final_corpus_size_bytes": int(detail.get("final_corpus_size_bytes") or 0),
+            "corpus_files": int(detail.get("corpus_files") or 0),
+            "corpus_size_bytes": int(detail.get("corpus_size_bytes") or 0),
+            "crash_found": bool(detail.get("crash_found")),
+            "rc": int(detail.get("rc") or 0),
+            "run_error_kind": str(detail.get("run_error_kind") or ""),
+            "terminal_reason": str(detail.get("terminal_reason") or ""),
+            "plateau_detected": bool(detail.get("plateau_detected")),
+            "plateau_idle_seconds": int(detail.get("plateau_idle_seconds") or 0),
+            "seed_quality": dict(detail.get("seed_quality") or {}),
+        }
+    max_cov = max((f["final_cov"] for f in fuzzers.values()), default=0)
+    max_ft = max((f["final_ft"] for f in fuzzers.values()), default=0)
+    total_execs = sum(f["final_execs_per_sec"] for f in fuzzers.values())
+    return {
+        "fuzzers": fuzzers,
+        "aggregate": {
+            "max_cov": max_cov,
+            "max_ft": max_ft,
+            "total_execs_per_sec": total_execs,
+            "crash_found": any(f["crash_found"] for f in fuzzers.values()),
+            "fuzzer_count": len(fuzzers),
+        },
+        "coverage_loop_round": int(out.get("coverage_loop_round") or 0),
+        "coverage_loop_max_rounds": int(out.get("coverage_loop_max_rounds") or 0),
+        "coverage_plateau_streak": int(out.get("coverage_plateau_streak") or 0),
+        "coverage_seed_profile": str(out.get("coverage_seed_profile") or ""),
+        "coverage_quality_flags": list(out.get("coverage_quality_flags") or []),
+        "coverage_bottleneck_kind": str(out.get("coverage_bottleneck_kind") or ""),
+        "coverage_bottleneck_reason": str(out.get("coverage_bottleneck_reason") or ""),
+        "coverage_source_report": dict(out.get("coverage_source_report") or {}),
+    }
+
+
+def _coerce_error_object(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    code = str(raw.get("code") or "").strip().lower()
+    kind = str(raw.get("kind") or "").strip().lower()
+    stage = str(raw.get("stage") or "").strip().lower()
+    message = str(raw.get("message") or "").strip()
+    detail = str(raw.get("detail") or "").strip()
+    signature = str(raw.get("signature") or "").strip()
+    retryable = bool(raw.get("retryable"))
+    terminal = bool(raw.get("terminal"))
+    at = int(raw.get("at") or 0)
+    if at <= 0:
+        at = int(time.time())
+    if not (code or kind or message or signature or terminal):
+        return {}
+    return {
+        "code": code,
+        "kind": kind,
+        "stage": stage,
+        "message": message,
+        "detail": detail,
+        "signature": signature,
+        "retryable": retryable,
+        "terminal": terminal,
+        "at": at,
+    }
+
+
+def write_run_summary(out: dict[str, Any]) -> None:
+    repo_root_raw = out.get("repo_root")
+    if not repo_root_raw:
+        return
+    repo_root = Path(str(repo_root_raw))
+    if not repo_root.exists():
+        return
+
+    crash_found = bool(out.get("crash_found"))
+    crash_repro_done = bool(out.get("crash_repro_done"))
+    crash_repro_ok = bool(out.get("crash_repro_ok"))
+    error_obj = _coerce_error_object(out.get("error"))
+    last_error = str(out.get("last_error") or error_obj.get("message") or "").strip()
+    failed = bool(out.get("failed"))
+    run_error_kind = str(out.get("run_error_kind") or error_obj.get("code") or "").strip()
+    error_kind = str(out.get("error_kind") or error_obj.get("kind") or "").strip()
+    error_code = str(out.get("error_code") or error_obj.get("code") or "").strip()
+    error_signature = str(out.get("error_signature") or error_obj.get("signature") or "").strip()
+    status = (
+        "error"
+        if (
+            failed
+            or bool(error_obj.get("terminal"))
+            or last_error
+            or run_error_kind
+            or error_kind
+            or error_code
+            or (crash_found and crash_repro_done and not crash_repro_ok)
+        )
+        else ("crash_found" if crash_found else "ok")
+    )
+    harness_error = detect_harness_error(repo_root)
+    run_details = out.get("run_details") or []
+    fuzz_inventory = collect_fuzz_inventory(repo_root)
+    key_artifact_hashes = collect_key_artifact_hashes(repo_root)
+
+    bundle_dirs = [
+        d.name
+        for d in repo_root.iterdir()
+        if d.is_dir() and d.name.startswith(("challenge_bundle", "false_positive", "unreproducible"))
+    ]
+
+    data = {
+        "repo_url": out.get("repo_url"),
+        "repo_root": str(repo_root),
+        "status": status,
+        "message": out.get("message"),
+        "last_step": out.get("last_step"),
+        "step_count": out.get("step_count"),
+        "build_attempts": out.get("build_attempts"),
+        "build_rc": out.get("build_rc"),
+        "build_error_kind": out.get("build_error_kind") or "",
+        "build_error_code": out.get("build_error_code") or "",
+        "run_rc": out.get("run_rc"),
+        "last_error": last_error,
+        "crash_found": crash_found,
+        "crash_evidence": out.get("crash_evidence") or "none",
+        "run_error_kind": run_error_kind,
+        "error_kind": error_kind,
+        "error_code": error_code,
+        "error_signature": error_signature,
+        "error": {
+            "code": error_code,
+            "kind": error_kind,
+            "stage": str(error_obj.get("stage") or ""),
+            "message": last_error,
+            "detail": str(error_obj.get("detail") or ""),
+            "signature": error_signature,
+            "retryable": bool(error_obj.get("retryable")),
+            "terminal": bool(error_obj.get("terminal") or failed),
+            "at": int(error_obj.get("at") or time.time()),
+        },
+        "crash_repro_done": crash_repro_done,
+        "crash_repro_ok": crash_repro_ok,
+        "crash_repro_rc": int(out.get("crash_repro_rc") or 0),
+        "run_details": run_details,
+        "last_fuzzer": out.get("last_fuzzer"),
+        "last_crash_artifact": out.get("last_crash_artifact"),
+        "harness_error": harness_error,
+        "analysis_evidence_count": int(out.get("analysis_evidence_count") or 0),
+        "target_scoring_enabled": bool(out.get("target_scoring_enabled") or False),
+        "target_score_breakdown_available": bool(out.get("target_score_breakdown_available") or False),
+        "constraint_memory_count": int(out.get("constraint_memory_count") or 0),
+        "decision_trace_count": int(out.get("decision_trace_count") or 0),
+        "latest_decision_snapshot": dict(out.get("latest_decision_snapshot") or {}),
+        "crash_signature_dedup_hit": bool(out.get("crash_signature_dedup_hit") or False),
+        "coverage_bottleneck_kind": str(out.get("coverage_bottleneck_kind") or ""),
+        "coverage_bottleneck_reason": str(out.get("coverage_bottleneck_reason") or ""),
+        "fix_patch_path": out.get("fix_patch_path") or "",
+        "fix_patch_files": out.get("fix_patch_files") or [],
+        "fix_patch_bytes": out.get("fix_patch_bytes") or 0,
+        "crash_info_path": str(repo_root / "crash_info.md"),
+        "crash_analysis_path": str(repo_root / "crash_analysis.md"),
+        "reproducer_path": str(repo_root / "reproduce.py"),
+        "bundles": bundle_dirs,
+        "fuzz_inventory": fuzz_inventory,
+        "key_artifact_hashes": key_artifact_hashes,
+        "plan_policy": {
+            "fix_on_crash": bool(out.get("plan_fix_on_crash", True)),
+            "max_fix_rounds": int(out.get("plan_max_fix_rounds") or 0),
+        },
+        "plan_schema_guard": {
+            "retry_reason": str(out.get("plan_retry_reason") or ""),
+            "schema_valid_before_retry": bool(out.get("plan_targets_schema_valid_before_retry") or False),
+            "schema_valid_after_retry": bool(out.get("plan_targets_schema_valid_after_retry") or False),
+            "used_fallback_targets": bool(out.get("plan_used_fallback_targets") or False),
+        },
+        "build_fix_policy": {
+            "max_fix_rounds": int(out.get("max_fix_rounds") if out.get("max_fix_rounds") is not None else 0),
+            "same_error_max_retries": int(
+                out.get("same_error_max_retries")
+                if out.get("same_error_max_retries") is not None
+                else 0
+            ),
+            "fix_action_type": str(out.get("fix_action_type") or ""),
+            "fix_effect": str(out.get("fix_effect") or ""),
+            "final_build_error_code": str(out.get("build_error_code") or ""),
+            "final_build_error_signature": str(out.get("build_error_signature") or ""),
+            "error_signature_before": str(out.get("build_error_signature_before") or ""),
+            "error_signature_after": str(out.get("build_error_signature_after") or ""),
+        },
+        "re_stage": {
+            "workspace_root": str(out.get("re_workspace_root") or ""),
+            "re_build_done": bool(out.get("re_build_done") or False),
+            "re_build_ok": bool(out.get("re_build_ok") or False),
+            "re_build_rc": int(out.get("re_build_rc") or 0),
+            "re_build_report_path": str(out.get("re_build_report_path") or ""),
+            "re_build_json_path": str(out.get("re_build_json_path") or ""),
+            "re_run_done": bool(out.get("re_run_done") or False),
+            "re_run_ok": bool(out.get("re_run_ok") or False),
+            "re_run_rc": int(out.get("re_run_rc") or 0),
+            "re_run_report_path": str(out.get("re_run_report_path") or ""),
+            "re_run_json_path": str(out.get("re_run_json_path") or ""),
+        },
+        "coverage_loop": {
+            "max_rounds": int(
+                out.get("coverage_loop_max_rounds")
+                if out.get("coverage_loop_max_rounds") is not None
+                else 0
+            ),
+            "round": int(out.get("coverage_loop_round") or 0),
+            "should_improve": bool(out.get("coverage_should_improve") or False),
+            "reason": str(out.get("coverage_improve_reason") or ""),
+            "target_name": str(out.get("coverage_target_name") or ""),
+            "target_api": str(out.get("coverage_target_api") or out.get("selected_target_api") or ""),
+            "seed_profile": str(out.get("coverage_seed_profile") or ""),
+            "seed_quality": dict(out.get("coverage_seed_quality") or {}),
+            "seed_families_suggested": list(out.get("coverage_seed_families_suggested") or []),
+            "seed_families_covered": list(out.get("coverage_seed_families_covered") or []),
+            "seed_families_missing": list(out.get("coverage_seed_families_missing") or []),
+            "quality_flags": list(out.get("coverage_quality_flags") or []),
+            "target_depth_score": int(out.get("coverage_target_depth_score") or 0),
+            "target_depth_class": str(out.get("coverage_target_depth_class") or ""),
+            "selection_bias_reason": str(out.get("coverage_selection_bias_reason") or ""),
+            "plateau_streak": int(out.get("coverage_plateau_streak") or 0),
+            "last_max_cov": int(out.get("coverage_last_max_cov") or 0),
+            "last_ft": int(out.get("coverage_last_ft") or 0),
+            "replan_required": bool(out.get("coverage_replan_required") or False),
+            "replan_effective": bool(out.get("coverage_replan_effective") or False),
+            "replan_reason": str(out.get("coverage_replan_reason") or ""),
+            "improve_mode": str(out.get("coverage_improve_mode") or ""),
+            "round_budget_exhausted": bool(out.get("coverage_round_budget_exhausted") or False),
+            "stop_reason": str(out.get("coverage_stop_reason") or ""),
+            "corpus_sources": list(out.get("coverage_corpus_sources") or []),
+            "seed_counts": dict(out.get("coverage_seed_counts") or {}),
+            "seed_counts_raw": dict(out.get("coverage_seed_counts_raw") or {}),
+            "seed_counts_filtered": dict(out.get("coverage_seed_counts_filtered") or {}),
+            "seed_noise_rejected_count": int(out.get("coverage_seed_noise_rejected_count") or 0),
+            "seed_family_coverage": dict(out.get("coverage_seed_family_coverage") or {}),
+            "repo_examples_filtered": bool(out.get("coverage_repo_examples_filtered") or False),
+            "repo_examples_rejected_count": int(out.get("coverage_repo_examples_rejected_count") or 0),
+            "repo_examples_accepted_count": int(out.get("coverage_repo_examples_accepted_count") or 0),
+            "history": list(out.get("coverage_history") or []),
+        },
+        "restart_to_plan": {
+            "active": bool(out.get("restart_to_plan") or False),
+            "reason": str(out.get("restart_to_plan_reason") or ""),
+            "stage": str(out.get("restart_to_plan_stage") or ""),
+            "error_text": str(out.get("restart_to_plan_error_text") or ""),
+            "report_path": str(out.get("restart_to_plan_report_path") or ""),
+            "count": int(out.get("restart_to_plan_count") or 0),
+        },
+        "selected_targets_path": str(out.get("selected_targets_path") or ""),
+        "observed_target_path": str(out.get("observed_target_path") or ""),
+        "synthesize_target": {
+            "selected_name": str(out.get("synthesize_selected_target_name") or ""),
+            "selected_api": str(out.get("synthesize_selected_target_api") or ""),
+            "observed_api": str(out.get("synthesize_observed_target_api") or ""),
+            "observed_harness": str(out.get("synthesize_observed_harness") or ""),
+            "drifted": bool(out.get("synthesize_target_drifted") or False),
+            "drift_reason": str(out.get("synthesize_target_drift_reason") or ""),
+            "relation": str(out.get("synthesize_target_relation") or ""),
+            "runtime_viability": str(out.get("synthesize_target_runtime_viability") or ""),
+        },
+        "seed_quality": dict(out.get("coverage_seed_quality") or {}),
+        "seed_family_coverage": {
+            "suggested": list(out.get("coverage_seed_families_suggested") or []),
+            "covered": list(out.get("coverage_seed_families_covered") or []),
+            "missing": list(out.get("coverage_seed_families_missing") or []),
+            "quality_flags": list(out.get("coverage_quality_flags") or []),
+        },
+        "seed_bootstrap": {
+            "raw_counts": dict(out.get("coverage_seed_counts_raw") or {}),
+            "filtered_counts": dict(out.get("coverage_seed_counts_filtered") or {}),
+            "noise_rejected_count": int(out.get("coverage_seed_noise_rejected_count") or 0),
+            "family_coverage": dict(out.get("coverage_seed_family_coverage") or {}),
+        },
+        "fuzz_performance": _build_fuzz_performance(run_details, out),
+        "timestamp": time.time(),
+    }
+
+    summary_json = repo_root / "run_summary.json"
+    summary_md = repo_root / "run_summary.md"
+    try:
+        summary_json.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+    md_lines = [
+        "# Run Summary",
+        "",
+        f"- Status: {status}",
+        f"- Repo: {data['repo_url']}",
+        f"- Repo root: {data['repo_root']}",
+        f"- Last step: {data['last_step']}",
+        f"- Build attempts: {data['build_attempts']}",
+        f"- Build rc: {data['build_rc']}",
+        f"- Build error kind/code: {data['build_error_kind'] or 'none'}/{data['build_error_code'] or 'none'}",
+        f"- Run rc: {data['run_rc']}",
+        f"- Crash evidence: {data['crash_evidence']}",
+        f"- Crash found: {crash_found}",
+        f"- Crash repro done/ok: {crash_repro_done}/{crash_repro_ok}",
+        f"- Harness error: {harness_error}",
+        f"- Fuzzer binaries: {fuzz_inventory['fuzzer_count']}",
+        f"- Corpus files: {fuzz_inventory['corpus_total_files']}",
+        f"- Corpus size: {fuzz_inventory['corpus_total_human']}",
+        f"- Coverage target: {data['coverage_loop']['target_name'] or 'n/a'}",
+        f"- Coverage target api: {data['coverage_loop']['target_api'] or 'n/a'}",
+        f"- Seed profile: {data['coverage_loop']['seed_profile'] or 'n/a'}",
+        f"- Decision trace count: {data['decision_trace_count']}",
+        f"- Crash signature dedup hit: {data['crash_signature_dedup_hit']}",
+        f"- Selected targets path: {data['selected_targets_path'] or 'n/a'}",
+        f"- Observed target path: {data['observed_target_path'] or 'n/a'}",
+        f"- Synthesize selected target: {data['synthesize_target']['selected_api'] or data['synthesize_target']['selected_name'] or 'n/a'}",
+        f"- Synthesize observed target: {data['synthesize_target']['observed_api'] or 'n/a'}",
+        f"- Synthesize target drifted: {data['synthesize_target']['drifted']}",
+        f"- Synthesize target relation: {data['synthesize_target']['relation'] or 'n/a'}",
+        f"- Synthesize runtime viability: {data['synthesize_target']['runtime_viability'] or 'n/a'}",
+        f"- Target depth: {data['coverage_loop']['target_depth_class'] or 'n/a'} ({data['coverage_loop']['target_depth_score']})",
+        f"- Target selection bias: {data['coverage_loop']['selection_bias_reason'] or 'n/a'}",
+        f"- Improve mode: {data['coverage_loop']['improve_mode'] or 'n/a'}",
+        f"- Plateau streak: {data['coverage_loop']['plateau_streak']}",
+        f"- Replan required: {data['coverage_loop']['replan_required']}",
+        f"- Replan effective: {data['coverage_loop']['replan_effective']}",
+        f"- Replan reason: {data['coverage_loop']['replan_reason'] or 'n/a'}",
+        f"- Round budget exhausted: {data['coverage_loop']['round_budget_exhausted']}",
+        f"- Coverage stop reason: {data['coverage_loop']['stop_reason'] or 'n/a'}",
+        f"- Repo examples filtered: {data['coverage_loop']['repo_examples_filtered']}",
+        f"- Repo examples accepted/rejected: {data['coverage_loop']['repo_examples_accepted_count']}/{data['coverage_loop']['repo_examples_rejected_count']}",
+        f"- Seed bootstrap raw counts: {data['seed_bootstrap']['raw_counts']}",
+        f"- Seed bootstrap filtered counts: {data['seed_bootstrap']['filtered_counts']}",
+        f"- Seed bootstrap noise rejected: {data['seed_bootstrap']['noise_rejected_count']}",
+        f"- Plan crash policy: {'fix' if data['plan_policy']['fix_on_crash'] else 'report-only'}",
+        f"- Plan max fix rounds: {data['plan_policy']['max_fix_rounds']}",
+        f"- Plan retry reason: {data['plan_schema_guard']['retry_reason'] or 'none'}",
+        f"- Plan fallback targets: {data['plan_schema_guard']['used_fallback_targets']}",
+        f"- Build/fix max rounds: {data['build_fix_policy']['max_fix_rounds']}",
+        f"- Build same-error max retries: {data['build_fix_policy']['same_error_max_retries']}",
+        f"- Key artifact hashes: {len(key_artifact_hashes)}",
+    ]
+    if key_artifact_hashes:
+        md_lines.extend(["", "## Key Artifact Hashes"])
+        for path, digest in sorted(key_artifact_hashes.items()):
+            md_lines.append(f"- {path}: `{digest}`")
+    perf = data.get("fuzz_performance") or {}
+    agg = perf.get("aggregate") or {}
+    if agg:
+        md_lines.extend([
+            "",
+            "## Fuzz Performance (Aggregate)",
+            f"- Max coverage (edges): {agg.get('max_cov', 0)}",
+            f"- Max features: {agg.get('max_ft', 0)}",
+            f"- Total execs/sec: {agg.get('total_execs_per_sec', 0)}",
+            f"- Crash found: {agg.get('crash_found', False)}",
+            f"- Fuzzer count: {agg.get('fuzzer_count', 0)}",
+            f"- Coverage loop round: {perf.get('coverage_loop_round', 0)}/{perf.get('coverage_loop_max_rounds', 0)}",
+            f"- Plateau streak: {perf.get('coverage_plateau_streak', 0)}",
+            f"- Quality flags: {perf.get('coverage_quality_flags') or 'none'}",
+        ])
+    if run_details:
+        md_lines.extend(["", "## Fuzzer Effectiveness (Per-Fuzzer)"])
+        for item in run_details:
+            md_lines.append(
+                "- {fuzzer}: rc={rc}, cov={cov}, ft={ft}, exec/s={eps}, "
+                "corpus={corp_files}/{corp_size}, rss={rss}MB, "
+                "plateau={plateau}({plateau_sec}s), terminal={terminal}".format(
+                    fuzzer=item.get("fuzzer"),
+                    rc=item.get("rc"),
+                    cov=item.get("final_cov"),
+                    ft=item.get("final_ft"),
+                    eps=item.get("final_execs_per_sec", 0),
+                    corp_files=item.get("final_corpus_files"),
+                    corp_size=bytes_human(int(item.get("final_corpus_size_bytes") or 0)),
+                    rss=item.get("final_rss_mb"),
+                    plateau=item.get("plateau_detected", False),
+                    plateau_sec=item.get("plateau_idle_seconds", 0),
+                    terminal=item.get("terminal_reason") or "none",
+                )
+            )
+    if last_error:
+        md_lines.extend(["", "## Last Error", "```text", last_error, "```"])
+    if crash_found:
+        md_lines.extend(
+            [
+                "",
+                "## Crash",
+                f"- Fuzzer: {data['last_fuzzer']}",
+                f"- Artifact: {data['last_crash_artifact']}",
+                f"- crash_info.md: {data['crash_info_path']}",
+                f"- crash_analysis.md: {data['crash_analysis_path']}",
+            ]
+        )
+    if data["fix_patch_path"]:
+        md_lines.extend(
+            [
+                "",
+                "## Fix Patch",
+                f"- Patch: {data['fix_patch_path']}",
+                f"- Files changed: {len(data['fix_patch_files'])}",
+            ]
+        )
+        if data["fix_patch_files"]:
+            md_lines.extend([f"- {p}" for p in data["fix_patch_files"]])
+    if bundle_dirs:
+        md_lines.extend(["", "## Bundles"] + [f"- {b}" for b in bundle_dirs])
+    if data["restart_to_plan"]["active"]:
+        md_lines.extend(
+            [
+                "",
+                "## Restart To Plan",
+                f"- reason: {data['restart_to_plan']['reason']}",
+                f"- stage: {data['restart_to_plan']['stage']}",
+                f"- count: {data['restart_to_plan']['count']}",
+                f"- report: {data['restart_to_plan']['report_path']}",
+            ]
+        )
+
+    try:
+        summary_md.write_text("\n".join(md_lines) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+    out_dir = Path(str(fuzz_inventory.get("fuzz_out_dir") or ""))
+    if out_dir.is_dir():
+        eff_json = out_dir / "fuzz_effectiveness.json"
+        eff_md = out_dir / "fuzz_effectiveness.md"
+        eff = {
+            "status": status,
+            "repo_url": data.get("repo_url"),
+            "run_rc": data.get("run_rc"),
+            "crash_found": crash_found,
+            "crash_evidence": data.get("crash_evidence"),
+            "run_details": run_details,
+            "fuzz_inventory": fuzz_inventory,
+            "timestamp": data.get("timestamp"),
+        }
+        try:
+            eff_json.write_text(json.dumps(eff, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            pass
+        eff_lines = [
+            "# Fuzz Effectiveness",
+            "",
+            f"- Status: {status}",
+            f"- Crash found: {crash_found}",
+            f"- Run rc: {data.get('run_rc')}",
+            f"- Fuzzer binaries: {fuzz_inventory['fuzzer_count']}",
+            f"- Corpus files: {fuzz_inventory['corpus_total_files']}",
+            f"- Corpus size: {fuzz_inventory['corpus_total_human']}",
+        ]
+        if run_details:
+            eff_lines.extend(["", "## Per Fuzzer"])
+            for item in run_details:
+                eff_lines.append(
+                    "- {fuzzer}: rc={rc}, cov={cov}, ft={ft}, corpus={corp_files}/{corp_size}, exec/s={eps}, rss={rss}MB".format(
+                        fuzzer=item.get("fuzzer"),
+                        rc=item.get("rc"),
+                        cov=item.get("final_cov"),
+                        ft=item.get("final_ft"),
+                        corp_files=item.get("final_corpus_files"),
+                        corp_size=bytes_human(int(item.get("final_corpus_size_bytes") or 0)),
+                        eps=item.get("final_execs_per_sec"),
+                        rss=item.get("final_rss_mb"),
+                    )
+                )
+        try:
+            eff_md.write_text("\n".join(eff_lines) + "\n", encoding="utf-8")
+        except Exception:
+            pass

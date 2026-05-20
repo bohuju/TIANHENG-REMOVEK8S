@@ -1,0 +1,222 @@
+<h2>MemoryAdapter Python 接口 &amp; MCP 工具映射</h2>
+<p class="subtitle">Sherpa 工作流节点通过 MemoryAdapter 统一调用 GBrain MCP 工具</p>
+
+<div class="section">
+  <h3>1. MemoryAdapter 核心接口</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="font-family:monospace;font-size:0.72em;padding:16px;line-height:1.6">
+<pre style="margin:0;background:none;border:none;padding:0">
+<span style="color:var(--muted)"># sherpa/memory_adapter.py</span>
+
+class MemoryAdapter:
+    <span style="color:var(--muted)">"""Sherpa 与 GBrain 之间的 MCP 客户端适配器"""</span>
+
+    def __init__(self, mcp_command: str = "gbrain", mcp_args: list = ["serve"]):
+        <span style="color:var(--muted)"># 启动 MCP stdio 子进程，建立 JSON-RPC 通道</span>
+        ...
+
+    <span style="color:var(--muted)"># ── 查询接口（各节点进入时调用）──</span>
+
+    async def query_experience(self, query: str, context: dict) -&gt; list[MemoryHit]:
+        <span style="color:var(--muted)">"""混合搜索：关键词 + 向量 + 图谱，返回相关历史经验"""</span>
+
+    async def get_page(self, slug: str) -&gt; Page | None:
+        <span style="color:var(--muted)">"""按 slug 精确读取一个 page"""</span>
+
+    async def get_target_profile(self, repo_url: str) -&gt; Page | None:
+        <span style="color:var(--muted)">"""读取目标仓库的累积画像（slug → fuzz/targets/&lt;owner&gt;-&lt;repo&gt;）"""</span>
+
+    async def find_similar_crashes(self, signature: str, limit: int = 5) -&gt; list[Page]:
+        <span style="color:var(--muted)">"""搜索签名相似的历史崩溃"""</span>
+
+    async def suggest_strategies(self, language: str, module: str) -&gt; list[Page]:
+        <span style="color:var(--muted)">"""查询同类语言/模块的有效策略，按 success_rate 排序"""</span>
+
+    <span style="color:var(--muted)"># ── 写入接口（阶段结束后调用）──</span>
+
+    async def write_page(self, slug: str, frontmatter: dict,
+                         compiled_truth: str, timeline: list[str]) -&gt; bool:
+        <span style="color:var(--muted)">"""写入一个 page（upsert 语义）"""</span>
+
+    async def add_timeline(self, slug: str, entry: str) -&gt; bool:
+        <span style="color:var(--muted)">"""追加一条 timeline entry"""</span>
+
+    async def add_link(self, from_slug: str, to_slug: str,
+                       link_type: str, source: str = "sherpa") -&gt; bool:
+        <span style="color:var(--muted)">"""建立两个页面之间的类型化关系"""</span>
+
+    <span style="color:var(--muted)"># ── 批量接口（非关键阶段使用）──</span>
+
+    async def batch_write(self, ops: list[WriteOp]) -&gt; BatchResult:
+        <span style="color:var(--muted)">"""攒批异步写入，失败自动重试 3 次，部分成功返回详细报告"""</span>
+
+    <span style="color:var(--muted)"># ── 建议接口（节点进入时主动调用）──</span>
+
+    async def get_suggestions(self, node: str, ctx: dict) -&gt; Suggestion | None:
+        <span style="color:var(--muted)">"""根据节点类型和上下文，查询 GBrain 并生成结构化建议。
+        返回 None 表示没有足够相关的历史经验。"""</span>
+
+    <span style="color:var(--muted)"># ── 会话总结接口（memory-summarize 节点专用）──</span>
+
+    async def summarize_session(self, session: SessionData) -&gt; str:
+        <span style="color:var(--muted)">"""聚合整个会话数据，写入 session page + crash pages + 更新 target
+        profile + 建立所有 link 关系。返回总结的 markdown。"""</span>
+</pre>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>2. MCP 工具映射表</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="font-size:0.85em;padding:16px">
+      <table style="width:100%;border-collapse:collapse">
+        <tr style="border-bottom:1px solid var(--border)">
+          <th style="text-align:left;padding:8px">MemoryAdapter 方法</th>
+          <th style="text-align:left;padding:8px">调用的 GBrain MCP 工具</th>
+          <th style="text-align:left;padding:8px">调用方式</th>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px;font-size:0.8em"><code>query_experience()</code></td>
+          <td style="padding:8px;font-size:0.8em"><code>query</code> / <code>search</code></td>
+          <td style="padding:8px;font-size:0.8em">hybrid search，带 intent detection</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px;font-size:0.8em"><code>get_page()</code></td>
+          <td style="padding:8px;font-size:0.8em"><code>get_page</code></td>
+          <td style="padding:8px;font-size:0.8em">按 slug 精确读取</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px;font-size:0.8em"><code>find_similar_crashes()</code></td>
+          <td style="padding:8px;font-size:0.8em"><code>search</code> + <code>traverse_graph</code></td>
+          <td style="padding:8px;font-size:0.8em">先搜索，再沿 similar_to 边扩展</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px;font-size:0.8em"><code>suggest_strategies()</code></td>
+          <td style="padding:8px;font-size:0.8em"><code>query</code></td>
+          <td style="padding:8px;font-size:0.8em">带 tag 和 frontmatter 过滤的混合搜索</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px;font-size:0.8em"><code>write_page()</code></td>
+          <td style="padding:8px;font-size:0.8em"><code>put_page</code></td>
+          <td style="padding:8px;font-size:0.8em">upsert 语义</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px;font-size:0.8em"><code>add_timeline()</code></td>
+          <td style="padding:8px;font-size:0.8em"><code>add_timeline_entry</code></td>
+          <td style="padding:8px;font-size:0.8em">追加结构化事件</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px;font-size:0.8em"><code>add_link()</code></td>
+          <td style="padding:8px;font-size:0.8em"><code>add_link</code></td>
+          <td style="padding:8px;font-size:0.8em">建立类型化关系边</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px;font-size:0.8em"><code>batch_write()</code></td>
+          <td style="padding:8px;font-size:0.8em"><code>put_page</code> × N + <code>add_link</code> × N</td>
+          <td style="padding:8px;font-size:0.8em">顺序调用，部分失败继续，最终报告</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px;font-size:0.8em"><code>get_suggestions()</code></td>
+          <td style="padding:8px;font-size:0.8em"><code>query</code> + <code>traverse_graph</code></td>
+          <td style="padding:8px;font-size:0.8em">组合调用，结果结构化封装为 Suggestion</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px;font-size:0.8em"><code>summarize_session()</code></td>
+          <td style="padding:8px;font-size:0.8em">全部写入类工具</td>
+          <td style="padding:8px;font-size:0.8em">多步事务性写入</td>
+        </tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>3. Workflow 节点集成示例</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="font-size:0.82em;padding:16px">
+      <p><strong>plan 节点：</strong></p>
+      <pre style="margin:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:0.82em">
+<span style="color:var(--muted)"># plan 节点进入时</span>
+suggestion = <span style="color:#60a5fa">await</span> memory.get_suggestions(<span style="color:#f59e0b">"plan"</span>, {
+    <span style="color:#f59e0b">"repo_url"</span>: target.repo_url,
+    <span style="color:#f59e0b">"repo_language"</span>: target.language,
+})
+<span style="color:#60a5fa">if</span> suggestion:
+    logger.info(<span style="color:#f59e0b">f"GBrain 建议: {suggestion.summary}"</span>)
+    <span style="color:var(--muted)"># 将建议作为 plan 阶段的参考上下文</span>
+
+<span style="color:var(--muted)"># plan 阶段结束后</span>
+<span style="color:#60a5fa">await</span> memory.add_timeline(target_slug,
+    <span style="color:#f59e0b">f"{timestamp}: plan 阶段完成，选择了 {len(targets)} 个目标"</span>)
+      </pre>
+
+      <p style="margin-top:16px"><strong>crash-triage 节点：</strong></p>
+      <pre style="margin:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:0.82em">
+<span style="color:var(--muted)"># crash-triage 节点进入时</span>
+similar = <span style="color:#60a5fa">await</span> memory.find_similar_crashes(crash.signature, limit=5)
+suggestion = <span style="color:#60a5fa">await</span> memory.get_suggestions(<span style="color:#f59e0b">"crash-triage"</span>, {
+    <span style="color:#f59e0b">"signature"</span>: crash.signature,
+    <span style="color:#f59e0b">"asan_report"</span>: crash.asan_report,
+})
+
+<span style="color:var(--muted)"># 分诊完成后（实时同步写）</span>
+<span style="color:#60a5fa">await</span> memory.write_page(
+    slug=<span style="color:#f59e0b">f"fuzz/crashes/{repo_slug}-{crash.id}"</span>,
+    frontmatter={...},
+    compiled_truth=<span style="color:#f59e0b">f"## Verdict\n\n{verdict}\n\n## Analysis\n\n{analysis}"</span>,
+    timeline=[<span style="color:#f59e0b">f"{ts}: crash-triage 判定为 {verdict}"</span>],
+)
+<span style="color:#60a5fa">await</span> memory.add_link(crash_slug, session_slug, <span style="color:#f59e0b">"discovered_in"</span>)
+      </pre>
+
+      <p style="margin-top:16px"><strong>memory-summarize 节点：</strong></p>
+      <pre style="margin:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:12px;font-size:0.82em">
+<span style="color:var(--muted)"># 整个 fuzz 会话结束后</span>
+summary_slug = <span style="color:#60a5fa">await</span> memory.summarize_session(SessionData(
+    repo_url=target.repo_url,
+    session_id=session.id,
+    stages_completed=session.completed_stages,
+    crashes=[c <span style="color:#60a5fa">for</span> c <span style="color:#60a5fa">in</span> session.crashes],
+    coverage_timeline=session.coverage_history,
+    strategies_used=session.applied_strategies,
+    harnesses_generated=session.harnesses,
+))
+      </pre>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>4. 容错设计</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="font-size:0.85em;padding:16px">
+      <table style="width:100%;border-collapse:collapse">
+        <tr style="border-bottom:1px solid var(--border)">
+          <th style="text-align:left;padding:8px">场景</th>
+          <th style="text-align:left;padding:8px">策略</th>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px">MCP Server 未启动</td>
+          <td style="padding:8px;font-size:0.85em">MemoryAdapter init 时自动 <code>gbrain serve</code> 拉起子进程</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px">查询超时（> 5s）</td>
+          <td style="padding:8px;font-size:0.85em">返回空结果 + 记录 warning 日志，不阻塞节点</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px">写入失败（关键阶段）</td>
+          <td style="padding:8px;font-size:0.85em">重试 3 次，仍失败则写入本地日志作为 fallback，不阻塞 fuzz</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px">批量写入部分失败</td>
+          <td style="padding:8px;font-size:0.85em">成功的保留，失败的写入本地 recovery log，下次重试</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px">GBrain 数据库损坏</td>
+          <td style="padding:8px;font-size:0.85em">Sherpa 正常运行不受影响，GBrain 侧 <code>gbrain doctor</code> 修复</td>
+        </tr>
+      </table>
+    </div>
+  </div>
+</div>

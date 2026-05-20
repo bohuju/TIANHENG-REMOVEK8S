@@ -1,0 +1,80 @@
+<h2>GBrain × Sherpa 集成：三种架构方案</h2>
+<p class="subtitle">核心目标：让 Sherpa 的每一次 fuzz 决策、crash 分析、策略经验都沉淀为 GBrain 中的长期记忆，后续任务可检索和复用</p>
+
+<div class="options" data-multiselect>
+  <div class="option" data-choice="a" onclick="toggleSelect(this)">
+    <div class="letter">A</div>
+    <div class="content">
+      <h3>Memory Sidecar — MCP 独立服务</h3>
+      <p>GBrain 作为独立 MCP Server 运行，Sherpa 工作流节点通过 MCP 协议远程调用 search / query / put_page 等工具。两张数据库独立。</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>优点</h4><ul><li>两个系统完全解耦，独立升级</li><li>GBrain 可服务多个 Sherpa 实例</li><li>符合 GBrain 现有 MCP 架构</li></ul></div>
+        <div class="cons"><h4>缺点</h4><ul><li>每次读写有 MCP 协议开销</li><li>需要维护两套数据库</li><li>网络依赖，MCP Server 挂了记忆就断</li></ul></div>
+      </div>
+    </div>
+  </div>
+  <div class="option" data-choice="b" onclick="toggleSelect(this)">
+    <div class="letter">B</div>
+    <div class="content">
+      <h3>Embedded Engine — 引擎内嵌</h3>
+      <p>Sherpa 直接引入 GBrain 的 operations.ts / engine 层作为库，共享同一 Postgres 实例。函数级调用，零网络延迟。</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>优点</h4><ul><li>零网络延迟，直接函数调用</li><li>单数据库，运维简单</li><li>可深度定制 GBrain 行为</li></ul></div>
+        <div class="cons"><h4>缺点</h4><ul><li>紧耦合，依赖 GBrain 内部 API</li><li>升级 GBrain 可能影响 Sherpa</li><li>GBrain 用 Bun 运行时，Sherpa 用 Python，跨语言调用复杂</li></ul></div>
+      </div>
+    </div>
+  </div>
+  <div class="option" data-choice="c" onclick="toggleSelect(this)">
+    <div class="letter">C</div>
+    <div class="content">
+      <h3>Knowledge Bridge — 适配器 + 缓存层（推荐）</h3>
+      <p>在 Sherpa 侧建一个轻量 MemoryAdapter，负责：将 fuzz 概念翻译为 GBrain page 结构；本地缓存热点查询；批量异步写入。底层通过 MCP 调用 GBrain。</p>
+      <div class="pros-cons">
+        <div class="pros"><h4>优点</h4><ul><li>兼顾解耦和性能（缓存 + 批量写入）</li><li>领域翻译层让两边各自演进</li><li>写入失败可重试，不影响 fuzz 主流程</li></ul></div>
+        <div class="cons"><h4>缺点</h4><ul><li>多了一层代码要维护</li><li>缓存一致性需要处理</li></ul></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>方案对比</h3>
+  <table style="width:100%;border-collapse:collapse;font-size:0.9em">
+    <tr style="border-bottom:1px solid var(--border)">
+      <th style="text-align:left;padding:8px">维度</th>
+      <th style="text-align:center;padding:8px">A. Sidecar</th>
+      <th style="text-align:center;padding:8px">B. Embedded</th>
+      <th style="text-align:center;padding:8px">C. Bridge</th>
+    </tr>
+    <tr style="border-bottom:1px solid var(--border)">
+      <td style="padding:8px">耦合度</td>
+      <td style="text-align:center;padding:8px;color:#22c55e">低</td>
+      <td style="text-align:center;padding:8px;color:#ef4444">高</td>
+      <td style="text-align:center;padding:8px;color:#22c55e">低</td>
+    </tr>
+    <tr style="border-bottom:1px solid var(--border)">
+      <td style="padding:8px">延迟</td>
+      <td style="text-align:center;padding:8px;color:#f59e0b">中</td>
+      <td style="text-align:center;padding:8px;color:#22c55e">低</td>
+      <td style="text-align:center;padding:8px;color:#22c55e">低（缓存命中）</td>
+    </tr>
+    <tr style="border-bottom:1px solid var(--border)">
+      <td style="padding:8px">运维复杂度</td>
+      <td style="text-align:center;padding:8px;color:#f59e0b">中</td>
+      <td style="text-align:center;padding:8px;color:#22c55e">低</td>
+      <td style="text-align:center;padding:8px;color:#f59e0b">中</td>
+    </tr>
+    <tr style="border-bottom:1px solid var(--border)">
+      <td style="padding:8px">跨语言兼容</td>
+      <td style="text-align:center;padding:8px;color:#22c55e">好（协议标准）</td>
+      <td style="text-align:center;padding:8px;color:#ef4444">差（TS↔Python）</td>
+      <td style="text-align:center;padding:8px;color:#22c55e">好</td>
+    </tr>
+    <tr style="border-bottom:1px solid var(--border)">
+      <td style="padding:8px">容错性</td>
+      <td style="text-align:center;padding:8px;color:#f59e0b">中</td>
+      <td style="text-align:center;padding:8px;color:#ef4444">差（强依赖）</td>
+      <td style="text-align:center;padding:8px;color:#22c55e">好（重试+降级）</td>
+    </tr>
+  </table>
+</div>

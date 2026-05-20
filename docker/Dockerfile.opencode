@@ -1,0 +1,74 @@
+# OpenCode runner image (separate from web UI)
+ARG OPENCODE_BASE_IMAGE=node:20-slim
+FROM ${OPENCODE_BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    HOME=/home/opencode \
+    NPM_CONFIG_REGISTRY="https://registry.npmmirror.com" \
+    NPM_CONFIG_FETCH_RETRIES=5 \
+    NPM_CONFIG_FETCH_RETRY_FACTOR=2 \
+    NPM_CONFIG_FETCH_RETRY_MINTIMEOUT=2000 \
+    NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT=30000 \
+    NPM_CONFIG_FETCH_TIMEOUT=300000
+
+# Use CN mirrors by default (override with build args if needed).
+ARG APT_MIRROR="http://mirrors.tuna.tsinghua.edu.cn/debian"
+ARG APT_SECURITY_MIRROR="http://mirrors.tuna.tsinghua.edu.cn/debian-security"
+
+# Best-effort: rewrite Debian apt sources to CN mirrors.
+RUN set -e; \
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do \
+      [ -f "$f" ] || continue; \
+      sed -i -E "s#https?://deb.debian.org/debian#${APT_MIRROR}#g" "$f"; \
+      sed -i -E "s#https?://security.debian.org/debian-security#${APT_SECURITY_MIRROR}#g" "$f"; \
+      sed -i -E "s#https?://security.debian.org/debian#${APT_SECURITY_MIRROR}#g" "$f"; \
+    done
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        python3 \
+        make \
+        g++ \
+        ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -g 10001 opencode \
+    && useradd -m -d /home/opencode -u 10001 -g 10001 -s /bin/bash opencode
+
+RUN set -eux; \
+    npm config set registry "$NPM_CONFIG_REGISTRY"; \
+    npm config set fetch-retries "$NPM_CONFIG_FETCH_RETRIES"; \
+    npm config set fetch-retry-factor "$NPM_CONFIG_FETCH_RETRY_FACTOR"; \
+    npm config set fetch-retry-mintimeout "$NPM_CONFIG_FETCH_RETRY_MINTIMEOUT"; \
+    npm config set fetch-retry-maxtimeout "$NPM_CONFIG_FETCH_RETRY_MAXTIMEOUT"; \
+    npm config set fetch-timeout "$NPM_CONFIG_FETCH_TIMEOUT"; \
+    for pkg in opencode-ai; do \
+      ok=0; \
+      for attempt in 1 2 3; do \
+        echo "[npm] installing $pkg (attempt $attempt/3)"; \
+        if npm i -g --loglevel=info "$pkg"; then \
+          ok=1; \
+          break; \
+        fi; \
+        sleep $((attempt * 2)); \
+      done; \
+      if [ "$ok" -ne 1 ]; then \
+        echo "[npm] failed to install $pkg after retries"; \
+        exit 1; \
+      fi; \
+    done; \
+    command -v opencode; \
+    opencode --version
+
+# Create opencode config with Qwen models (simplified format without $schema)
+RUN mkdir -p /home/opencode/.opencode && \
+    echo '{"provider":{"openrouter":{"models":{"qwen/qwen3-max-thinking":{},"qwen/qwen3-max":{},"qwen/qwen3-coder-plus":{}}}}}' \
+    > /home/opencode/.opencode/config.json && \
+    chown -R 10001:10001 /home/opencode /repo
+
+WORKDIR /repo
+USER 10001:10001
+CMD ["opencode", "run"]

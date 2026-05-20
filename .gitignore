@@ -1,0 +1,48 @@
+# Python caches
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# Local environments
+.venv/
+venv/
+env/
+ENV/
+myenv/
+sherpa_venv/
+.virtualenv/
+.direnv/
+
+# Runtime outputs / artifacts
+jobs/
+output/
+output*/
+/output/
+/output/**
+sorted/
+_docker_job_logs/
+
+# Runtime data / secrets
+config/
+harness_generator/src/config/
+_job_*.json
+_submit.json
+*.log
+*.sqlite3
+.env
+web_config.json
+web_codex.env
+k8s/overlays/cloudflare/cloudflare-tunnel-secret.yaml
+
+# Misc local files
+.DS_Store
+**/.DS_Store
+oss-fuzz/
+nul
+.pytest_cache/
+.playwright-cli/
+frontend-next/node_modules/
+frontend-next/.next/
+frontend-next/coverage/
+
+/.claude/worktrees

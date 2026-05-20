@@ -1,0 +1,119 @@
+<h2>架构总览：Sherpa + GBrain Memory Sidecar</h2>
+<p class="subtitle">GBrain 作为独立 MCP Server，Sherpa 工作流通过 MCP 协议读写长期记忆</p>
+
+<div class="section">
+  <h3>整体拓扑</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="font-family:monospace;font-size:0.8em;line-height:1.8;padding:24px">
+<pre style="margin:0;background:none;border:none;padding:0">
+┌─────────────────────────────────────────────────────┐
+│                  Sherpa 控制面                        │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  │
+│  │ FastAPI   │  │ Workflow │  │ MemoryAdapter    │  │
+│  │ 控制面    │  │ Graph    │  │ (Python MCP      │  │
+│  │           │  │ 状态机    │  │  Client)         │  │
+│  └──────────┘  └──────────┘  └────────┬─────────┘  │
+│                                       │             │
+│  ┌───────────────────────────────────┐│             │
+│  │        Postgres (Sherpa)           ││             │
+│  │  tasks / runs / crashes / coverage ││             │
+│  └───────────────────────────────────┘│             │
+└───────────────────────────────────────┼─────────────┘
+                                        │
+                          MCP over stdio │ (gbrain serve)
+                                        │
+┌───────────────────────────────────────┼─────────────┐
+│                  GBrain (GitNexus)     │              │
+│  ┌────────────────────────────────────┐│             │
+│  │  MCP Server (30+ tools)            ││             │
+│  │  search / query / get_page         ││             │
+│  │  put_page / add_link / traverse    ││             │
+│  │  add_timeline_entry / code_query   ││             │
+│  └────────────────┬───────────────────┘│             │
+│                   │                     │             │
+│  ┌────────────────┴───────────────────┐│             │
+│  │  BrainEngine                       ││             │
+│  │  operations → engine → search/graph││             │
+│  └────────────────┬───────────────────┘│             │
+│                   │                     │             │
+│  ┌────────────────┴───────────────────┐│             │
+│  │  Postgres + pgvector (GBrain)      ││             │
+│  │  pages / chunks / links / timeline ││             │
+│  └────────────────────────────────────┘│             │
+└─────────────────────────────────────────┘             │
+</pre>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>数据流：读路径（fuzz 阶段开始前查记忆）</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="font-size:0.85em;padding:16px">
+      <p><strong>例：crash-triage 阶段</strong></p>
+      <ol style="line-height:2">
+        <li>Sherpa crash-triage 节点收到候选崩溃</li>
+        <li><code>MemoryAdapter.query("similar crash: SIGSEGV in libxml2 parser")</code></li>
+        <li>GBrain hybrid search 返回历史相似崩溃的 page + timeline</li>
+        <li>Sherpa 对比当前崩溃特征和历史记录，辅助分诊决策</li>
+        <li>分诊完成后 → 写入新 page，用 link 关联到同一目标仓库页</li>
+      </ol>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>数据流：写路径（阶段结束后沉淀记忆）</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="font-size:0.85em;padding:16px">
+      <p><strong>两段式写入策略：</strong></p>
+      <table style="width:100%;border-collapse:collapse">
+        <tr style="border-bottom:1px solid var(--border)">
+          <th style="text-align:left;padding:8px">时机</th>
+          <th style="text-align:left;padding:8px">阶段</th>
+          <th style="text-align:left;padding:8px">写入内容</th>
+          <th style="text-align:left;padding:8px">方式</th>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px;color:#f59e0b">实时同步写入</td>
+          <td style="padding:8px">crash-triage<br/>crash-analysis</td>
+          <td style="padding:8px">崩溃分诊结论<br/>漏洞真假判定 + 证据</td>
+          <td style="padding:8px">MCP put_page<br/>同步调用</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px;color:#22c55e">批量异步写入</td>
+          <td style="padding:8px">plan / synthesize<br/>build / run<br/>coverage-analysis</td>
+          <td style="padding:8px">目标规划、harness模式<br/>覆盖率变化、策略调整</td>
+          <td style="padding:8px">攒批后 MCP put_page<br/>失败可重试</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border)">
+          <td style="padding:8px;color:#3b82f6">会话结束汇总</td>
+          <td style="padding:8px">整个 fuzz session</td>
+          <td style="padding:8px">Session 总结页<br/>跨阶段 link 关系</td>
+          <td style="padding:8px">MCP put_page +<br/>add_link batch</td>
+        </tr>
+      </table>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>关键设计决策</h3>
+  <div class="pros-cons">
+    <div class="pros"><h4>已确定</h4>
+      <ul>
+        <li>GBrain 独立 Postgres，与 Sherpa DB 物理隔离</li>
+        <li>MemoryAdapter 作为 Sherpa 内轻量 MCP client（Python）</li>
+        <li>关键阶段同步写，其余攒批异步写</li>
+        <li>写入失败不阻断 fuzz 主流程（降级为本地日志）</li>
+      </ul>
+    </div>
+    <div class="cons"><h4>待确认</h4>
+      <ul>
+        <li>GBrain MCP Server 部署方式（同 Pod sidecar / 独立服务 / stdio 子进程）</li>
+        <li>查询缓存策略（MemoryAdapter 内存缓存 vs 每次都查 GBrain）</li>
+        <li>GBrain page 的 type 体系和 frontmatter schema</li>
+      </ul>
+    </div>
+  </div>
+</div>

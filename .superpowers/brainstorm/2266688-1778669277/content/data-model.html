@@ -1,0 +1,219 @@
+<h2>GBrain Page 数据模型设计</h2>
+<p class="subtitle">Sherpa 在 GBrain 中存储的 5 种 page 类型、frontmatter schema 和页面间关系</p>
+
+<div class="section">
+  <h3>1. 五种 Page 类型总览</h3>
+
+  <div class="cards">
+    <div class="card">
+      <div class="card-body">
+        <h3>fuzz/target-repo</h3>
+        <p class="label">目标仓库画像</p>
+        <p style="font-size:0.85em">记录一个被 fuzz 的仓库的累积认知：攻击面、覆盖率趋势、推荐策略、历史发现</p>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-body">
+        <h3>fuzz/session</h3>
+        <p class="label">会话总结</p>
+        <p style="font-size:0.85em">一次完整 fuzz 会话的过程记录：各阶段结果、决策链、最终产出</p>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-body">
+        <h3>fuzz/crash</h3>
+        <p class="label">崩溃分析</p>
+        <p style="font-size:0.85em">单个崩溃的完整分析：签名、调用栈、真伪判定、根因、修复建议</p>
+      </div>
+    </div>
+  </div>
+
+  <div class="cards" style="margin-top:12px">
+    <div class="card">
+      <div class="card-body">
+        <h3>fuzz/strategy</h3>
+        <p class="label">策略经验</p>
+        <p style="font-size:0.85em">经过验证的 fuzz 策略：哪种 harness 模式、seed 家族、编译器选项对某类目标有效</p>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-body">
+        <h3>fuzz/harness</h3>
+        <p class="label">Harness 模式</p>
+        <p style="font-size:0.85em">单个 harness 的结构、针对的函数、编译结果、fuzz 效果</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>2. 各类型 Frontmatter Schema</h3>
+
+  <div class="mockup">
+    <div class="mockup-header">fuzz/target-repo — 目标仓库画像</div>
+    <div class="mockup-body" style="font-family:monospace;font-size:0.78em;padding:16px">
+<pre style="margin:0;background:none;border:none;padding:0">---
+type: fuzz/target-repo
+title: "libxml2 Fuzz 画像"
+tags: [fuzz, target, c, xml-parser]
+repo_url: https://github.com/GNOME/libxml2
+repo_language: c
+first_fuzzed_at: 2026-03-15
+last_fuzzed_at: 2026-05-10
+total_sessions: 12
+total_crashes_found: 47
+true_vulns_found: 3
+cve_ids: [CVE-2026-xxxxx, CVE-2026-yyyyy]
+attack_surfaces:
+  - module: parser
+    functions: [xmlParseDocument, xmlParseElement]
+    risk_level: high
+  - module: xpath
+    functions: [xmlXPathEvalExpression]
+    risk_level: medium
+recommended_strategies:
+  - dict_based_seeds
+  - ASAN_instrumented_build
+top_coverage: 68.3%
+---
+</pre>
+    </div>
+  </div>
+
+  <div class="mockup" style="margin-top:16px">
+    <div class="mockup-header">fuzz/crash — 崩溃分析</div>
+    <div class="mockup-body" style="font-family:monospace;font-size:0.78em;padding:16px">
+<pre style="margin:0;background:none;border:none;padding:0">---
+type: fuzz/crash
+title: "UAF in xmlParseElement via malformed entity"
+tags: [crash, use-after-free, parser, libxml2]
+repo: fuzz/targets/GNOME-libxml2
+session: fuzz/sessions/libxml2-20260510-1430
+crash_signature: SIGSEGV / xmlParseElement+0x1a4
+crash_type: heap-use-after-free
+verdict: true_positive
+severity: high
+cve_id: CVE-2026-xxxxx
+asan_report: |
+  ==12345==ERROR: AddressSanitizer: heap-use-after-free
+  READ of size 8 at 0x60400000fff0
+  ...
+related_crashes:
+  - fuzz/crashes/libxml2-crash-0031
+  - fuzz/crashes/libxslt-crash-0012
+discovered_at: 2026-05-10T14:32:00Z
+---
+</pre>
+    </div>
+  </div>
+
+  <div class="mockup" style="margin-top:16px">
+    <div class="mockup-header">fuzz/strategy — 策略经验</div>
+    <div class="mockup-body" style="font-family:monospace;font-size:0.78em;padding:16px">
+<pre style="margin:0;background:none;border:none;padding:0">---
+type: fuzz/strategy
+title: "C 语言 XML 解析器的 dict+ASAN 策略"
+tags: [strategy, c, xml, dict, asan]
+strategy_type: harness_pattern
+target_language: c
+effective_for_repos:
+  - fuzz/targets/GNOME-libxml2
+  - fuzz/targets/GNOME-libxslt
+harness_pattern: libfuzzer_dict_based
+seed_families: [xml_elements, entities, encodings]
+build_flags:
+  - -fsanitize=address
+  - -fno-omit-frame-pointer
+  - -g
+success_rate: 0.73
+avg_coverage_gain: +12.4%
+validated_sessions: 8
+---
+</pre>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>3. 页面间关系图谱</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="font-family:monospace;font-size:0.75em;line-height:1.9;padding:20px">
+<pre style="margin:0;background:none;border:none;padding:0">
+                    ┌──────────────────────────┐
+                    │  fuzz/targets/GNOME-      │
+                    │  libxml2                  │
+                    │  type: fuzz/target-repo   │
+                    └────────┬──────┬──────────┘
+                             │      │
+              source ────────┘      └──────── found_in_repo
+              │                                │
+    ┌─────────┴──────────┐          ┌──────────┴──────────┐
+    │ fuzz/sessions/      │          │ fuzz/crashes/        │
+    │ libxml2-20260510    │          │ libxml2-crash-0042   │
+    │ type: fuzz/session  │          │ type: fuzz/crash     │
+    └──┬──────────┬───────┘          └──────────┬───────────┘
+       │          │                             │
+       │ generated_in ──────────────────────────┘
+       │          │                             │
+       │          │          similar_to ────────┤
+       │          │                             │
+       │    ┌─────┴──────────────┐   ┌──────────┴──────────┐
+       │    │ fuzz/harnesses/     │   │ fuzz/crashes/        │
+       │    │ libxml2-harness-005│   │ libxml2-crash-0031   │
+       │    │ type: fuzz/harness  │   │ type: fuzz/crash     │
+       │    └────────┬────────────┘   └─────────────────────┘
+       │             │
+       │             │ follows_pattern
+       │             │
+       │    ┌────────┴──────────────┐
+       │    │ fuzz/strategies/       │
+       │    │ c-xml-dict-asan        │
+       │    │ type: fuzz/strategy    │
+       └────┼────────────────────────┘
+            │ applied_to (strategy → repo)
+            │
+
+  关系类型：
+  source           Session 记录了哪个目标仓库
+  discovered_in    Crash 在哪个会话中被发现
+  found_in_repo    Crash 属于哪个目标仓库
+  generated_in     Harness 在哪个会话中生成
+  follows_pattern  Harness 遵循哪个策略
+  applied_to       策略应用于哪个目标仓库
+  similar_to       Crash 和另一个 Crash 相似
+</pre>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>4. Page 内容结构：compiled_truth + timeline</h3>
+  <div class="mockup">
+    <div class="mockup-body" style="font-size:0.85em;padding:16px">
+      <p>每个 page 除了 frontmatter，还包含两部分正文：</p>
+
+      <div style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:12px;margin:12px 0">
+        <span class="label">compiled_truth — 当前最佳结论（可被新证据覆盖）</span>
+        <p style="font-size:0.85em;color:var(--muted);margin:4px 0">
+          例 crash page：<br/>
+          "该崩溃是一个 heap-use-after-free，发生在 xmlParseElement 处理畸形实体引用时。<br/>
+          根因是 xmlFreeNode 释放节点后未将父节点的 children 指针置空。<br/>
+          该漏洞可被远程触发，严重程度高。已在 v2.13.0 中修复。"<br/><br/>
+          ← 这里的结论会随着后续分析更新（比如发现更多影响范围、更新修复版本）
+        </p>
+      </div>
+
+      <div style="background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:12px;margin:12px 0">
+        <span class="label">timeline — 只追加的证据链</span>
+        <p style="font-size:0.85em;color:var(--muted);margin:4px 0">
+          - 2026-05-10T14:32: fuzz session 首次触发该崩溃，ASAN 报 heap-use-after-free<br/>
+          - 2026-05-10T14:45: crash-triage 初步判定为疑似真实漏洞<br/>
+          - 2026-05-10T15:10: crash-analysis 确认 UAF，定位 xmlFreeNode 调用<br/>
+          - 2026-05-10T15:30: 复现成功，POC 生成<br/>
+          - 2026-05-11T09:00: 提交上游，分配 CVE-2026-xxxxx<br/>
+          - 2026-05-12T16:00: 上游确认修复于 v2.13.0
+        </p>
+      </div>
+    </div>
+  </div>
+</div>

@@ -1,0 +1,79 @@
+<h2>详情面板 — 内嵌切换</h2>
+<p class="subtitle">点击结果后，列表区域替换为详情视图，顶部有返回按钮</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">查看模式（只读详情）</div>
+    <div class="mockup-body" style="display:flex;flex-direction:column;gap:10px;">
+      <div style="display:flex;align-items:center;gap:8px;padding:4px 0;">
+        <span style="cursor:pointer;font-size:18px;">← 返回列表</span>
+        <span style="font-size:11px;background:#e3f2fd;color:#0f5ad8;padding:2px 8px;border-radius:10px;margin-left:auto;">🎯 目标仓库</span>
+      </div>
+      <h3 style="margin:0;">GNOME/libxml2</h3>
+      <div style="font-size:12px;color:#999;">slug: fuzz/targets/GNOME-libxml2</div>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:13px;">
+        <div><span style="color:#999;">仓库地址</span><br><strong>https://github.com/GNOME/libxml2</strong></div>
+        <div><span style="color:#999;">语言</span><br><strong>C</strong></div>
+        <div><span style="color:#999;">首次Fuzz</span><br><strong>2026-03-12</strong></div>
+        <div><span style="color:#999;">最近Fuzz</span><br><strong>2026-05-18</strong></div>
+        <div><span style="color:#999;">总Session数</span><br><strong>12</strong></div>
+        <div><span style="color:#999;">发现Crash数</span><br><strong>8</strong></div>
+        <div><span style="color:#999;">真实漏洞</span><br><strong>3</strong></div>
+        <div><span style="color:#999;">最高覆盖率</span><br><strong>82%</strong></div>
+      </div>
+
+      <div style="font-size:13px;"><span style="color:#999;">CVE IDs</span><br><strong>CVE-2024-xxxxx, CVE-2025-yyyyy</strong></div>
+      <div style="font-size:13px;"><span style="color:#999;">推荐策略</span><br><strong>xml-parsing, dtd-validation, xinclude-expansion</strong></div>
+
+      <div style="display:flex;gap:8px;margin-top:8px;padding-top:12px;border-top:1px solid #e0e0e0;">
+        <button class="mock-button" style="background:#0f5ad8;color:white;border:none;padding:6px 16px;border-radius:6px;">✏️ 编辑</button>
+        <button class="mock-button" style="background:white;color:#c62828;border:1px solid #c62828;padding:6px 16px;border-radius:6px;">🗑 删除</button>
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup">
+    <div class="mockup-header">编辑模式（表单修改）</div>
+    <div class="mockup-body" style="display:flex;flex-direction:column;gap:10px;">
+      <div style="display:flex;align-items:center;gap:8px;padding:4px 0;">
+        <span style="cursor:pointer;font-size:18px;">← 取消编辑</span>
+        <span style="font-size:11px;color:#ed6c02;margin-left:auto;">编辑模式</span>
+      </div>
+      <h3 style="margin:0;">GNOME/libxml2</h3>
+
+      <div style="display:flex;flex-direction:column;gap:8px;font-size:13px;">
+        <div>
+          <label style="color:#999;font-size:11px;">仓库地址</label>
+          <input class="mock-input" style="width:100%;box-sizing:border-box;" value="https://github.com/GNOME/libxml2">
+        </div>
+        <div style="display:flex;gap:8px;">
+          <div style="flex:1;">
+            <label style="color:#999;font-size:11px;">语言</label>
+            <input class="mock-input" style="width:100%;box-sizing:border-box;" value="C">
+          </div>
+          <div style="flex:1;">
+            <label style="color:#999;font-size:11px;">真实漏洞数</label>
+            <input class="mock-input" style="width:100%;box-sizing:border-box;" value="3">
+          </div>
+        </div>
+        <div>
+          <label style="color:#999;font-size:11px;">推荐策略（逗号分隔）</label>
+          <input class="mock-input" style="width:100%;box-sizing:border-box;" value="xml-parsing, dtd-validation, xinclude-expansion">
+        </div>
+      </div>
+
+      <div style="display:flex;gap:8px;margin-top:8px;padding-top:12px;border-top:1px solid #e0e0e0;">
+        <button class="mock-button" style="background:#2e7d32;color:white;border:none;padding:6px 16px;border-radius:6px;">💾 保存</button>
+        <button class="mock-button" style="background:white;color:#666;border:1px solid #ccc;padding:6px 16px;border-radius:6px;">取消</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h3>完整交互流程</h3>
+<div class="section">
+  <p><strong>搜索/浏览</strong> → 结果列表 → <strong>点击某条</strong> → 只读详情 → <strong>点"编辑"</strong> → 编辑表单 → <strong>保存</strong> → 回到只读详情</p>
+  <p style="color:#999;font-size:13px;">删除需要确认弹窗（"确定删除 fuzz/targets/GNOME-libxml2 吗？此操作不可恢复。"）</p>
+  <p style="color:#999;font-size:13px;">如果 gbrain 不可用（enabled: false），抽屉正常打开但显示"记忆服务未启用"的空状态。</p>
+</div>

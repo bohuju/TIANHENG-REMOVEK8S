@@ -1,0 +1,1093 @@
+from __future__ import annotations
+
+import io
+import os
+import sys
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from fastapi.testclient import TestClient
+import psycopg
+
+
+ROOT = Path(__file__).resolve().parents[1]
+APP_DIR = ROOT / "harness_generator" / "src" / "langchain_agent"
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
+
+import main as web_main
+from job_store import PostgresJobStore
+from persistent_config import (
+    OpencodeProviderConfig,
+    WebPersistentConfig,
+    build_opencode_runtime_config,
+    list_opencode_provider_models_resolved,
+)
+
+
+class _ImmediateExecutor:
+    def submit(self, fn, *args, **kwargs):
+        fn(*args, **kwargs)
+
+        class _Done:
+            def result(self, timeout: float | None = None):
+                return None
+
+        return _Done()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_runtime_state(monkeypatch, tmp_path: Path):
+    db_url = os.environ.get(
+        "TEST_DATABASE_URL",
+        "postgresql://sherpa:sherpa@127.0.0.1:55432/sherpa",
+    )
+    monkeypatch.setenv("DATABASE_URL", db_url)
+    monkeypatch.setenv("SHERPA_WEB_AUTO_RESUME_ON_START", "0")
+    monkeypatch.setenv("MINIMAX_API_KEY", "test-minimax-key")
+    monkeypatch.setenv("MINIMAX_BASE_URL", "https://api.minimaxi.com/anthropic/v1")
+    monkeypatch.setenv("MINIMAX_MODEL", "MiniMax-M2.7-highspeed")
+    monkeypatch.delenv("LLM_key", raising=False)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    monkeypatch.delenv("DEEPSEEK_BASE_URL", raising=False)
+    monkeypatch.delenv("DEEPSEEK_MODEL", raising=False)
+    monkeypatch.delenv("SHERPA_OPENCODE_MCP_SERVERS_JSON", raising=False)
+    monkeypatch.delenv("SHERPA_OPENCODE_MCP_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_MODEL", raising=False)
+    monkeypatch.delenv("OPENCODE_MODEL", raising=False)
+    with web_main._JOBS_LOCK:
+        web_main._JOBS.clear()
+    store = PostgresJobStore(db_url)
+    store.init_schema()
+    with psycopg.connect(db_url, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("TRUNCATE TABLE jobs")
+    monkeypatch.setattr(web_main, "_JOB_STORE", store)
+    monkeypatch.setattr(web_main, "_init_job_store", lambda: None)
+    web_main._cfg_set(WebPersistentConfig())
+    monkeypatch.setattr(web_main, "executor", _ImmediateExecutor())
+    monkeypatch.setattr(web_main, "save_config", lambda cfg: None)
+    monkeypatch.setattr(web_main, "apply_config_to_env", lambda cfg: None)
+    monkeypatch.setattr(web_main, "_job_log_path", lambda job_id: tmp_path / f"{job_id}.log")
+    def _fake_execute_docker_stage(*, job_id, payload, wait_timeout):
+        return (
+            web_main.fuzz_logic(
+                payload.get("repo_url"),
+                max_len=payload.get("max_len"),
+                time_budget=payload.get("time_budget"),
+                run_time_budget=payload.get("run_time_budget"),
+                email=payload.get("email"),
+                docker_image=payload.get("docker_image"),
+                ai_key_path=payload.get("ai_key_path"),
+                oss_fuzz_dir=payload.get("oss_fuzz_dir"),
+                model=payload.get("model"),
+                resume_from_step=payload.get("resume_from_step"),
+                resume_repo_root=payload.get("resume_repo_root"),
+            ),
+            "node-test",
+        )
+
+    monkeypatch.setattr(web_main, "_execute_docker_stage", _fake_execute_docker_stage)
+
+    yield
+
+    with web_main._JOBS_LOCK:
+        web_main._JOBS.clear()
+
+
+def test_get_config_masks_secret_values():
+    with TestClient(web_main.app) as client:
+        web_main._cfg_set(
+            WebPersistentConfig(
+                openai_api_key="openai-secret",
+                openrouter_api_key="openrouter-secret",
+            )
+        )
+        response = client.get("/api/config")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["openai_api_key"] == ""
+    assert data["openrouter_api_key"] == ""
+    assert data["openai_api_key_set"] is True
+    assert data["openrouter_api_key_set"] is True
+
+
+def test_get_config_masks_opencode_provider_secret_values():
+    with TestClient(web_main.app) as client:
+        web_main._cfg_set(
+            WebPersistentConfig(
+                opencode_providers=[
+                    OpencodeProviderConfig(
+                        name="minimax",
+                        enabled=True,
+                        api_key="minimax-secret",
+                        base_url="https://api.minimax.io/v1",
+                        models=["minimax-text-01"],
+                    )
+                ]
+            )
+        )
+        response = client.get("/api/config")
+
+    assert response.status_code == 200
+    data = response.json()
+    providers = data.get("opencode_providers") or []
+    assert providers
+    assert providers[0]["name"] == "minimax"
+    assert providers[0]["api_key"] == ""
+    assert providers[0]["api_key_set"] is True
+
+
+def test_redact_sensitive_text_masks_env_and_bearer(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-secret-123")
+    src = "OPENAI_API_KEY=sk-secret-123 Authorization: Bearer sk-secret-123"
+    out = web_main._redact_sensitive_text(src)
+    assert "sk-secret-123" not in out
+    assert "OPENAI_API_KEY=***" in out
+    assert "Authorization: Bearer ***" in out
+
+
+def test_executor_mode_defaults_to_docker(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("SHERPA_EXECUTOR_MODE", raising=False)
+    assert web_main._executor_mode() == "docker"
+
+
+def test_executor_mode_rejects_unsupported(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("SHERPA_EXECUTOR_MODE", "local_thread")
+    with pytest.raises(RuntimeError):
+        web_main._executor_mode()
+
+
+
+def test_tee_write_redacts_sensitive_values(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-log-secret")
+    job_id = web_main._create_job("fuzz", "https://github.com/example/repo.git")
+    log_path = tmp_path / f"{job_id}.log"
+    tee = web_main._Tee(job_id, log_file=log_path)
+    try:
+        tee.write("token=sk-log-secret OPENAI_API_KEY=sk-log-secret\n")
+    finally:
+        tee.close()
+    snap = web_main._job_snapshot(job_id) or {}
+    log_text = str(snap.get("log") or "")
+    assert "sk-log-secret" not in log_text
+    assert "***" in log_text
+
+
+def test_put_config_preserves_existing_secrets_when_payload_is_null():
+    with TestClient(web_main.app) as client:
+        web_main._cfg_set(
+            WebPersistentConfig(
+                openai_api_key="keep-openai",
+                openrouter_api_key="keep-openrouter",
+            )
+        )
+        response = client.put(
+            "/api/config",
+            json={
+                "openai_api_key": None,
+                "openrouter_api_key": None,
+                "fuzz_time_budget": 1200,
+            },
+        )
+
+    assert response.status_code == 200
+    cfg = web_main._cfg_get()
+    assert cfg.openai_api_key == "test-minimax-key"
+    assert cfg.openrouter_api_key == "keep-openrouter"
+    assert cfg.fuzz_time_budget == 1200
+
+
+def test_put_config_preserves_and_clears_opencode_provider_secret():
+    with TestClient(web_main.app) as client:
+        web_main._cfg_set(
+            WebPersistentConfig(
+                opencode_providers=[
+                    OpencodeProviderConfig(
+                        name="minimax",
+                        enabled=True,
+                        api_key="keep-provider-key",
+                        base_url="https://api.minimax.io/v1",
+                    )
+                ]
+            )
+        )
+
+        # Preserve: empty api_key with clear_api_key=false keeps existing key.
+        response_keep = client.put(
+            "/api/config",
+            json={
+                "fuzz_time_budget": 1000,
+                "opencode_providers": [
+                    {
+                        "name": "minimax",
+                        "enabled": True,
+                        "base_url": "https://api.minimax.io/v1",
+                        "api_key": "",
+                        "clear_api_key": False,
+                        "models": ["minimax-text-01"],
+                        "headers": {},
+                        "options": {},
+                    }
+                ],
+            },
+        )
+        assert response_keep.status_code == 200
+        cfg_keep = web_main._cfg_get()
+        assert cfg_keep.opencode_providers[0].api_key == "test-minimax-key"
+
+        # Clear: explicit clear_api_key removes the saved key.
+        response_clear = client.put(
+            "/api/config",
+            json={
+                "fuzz_time_budget": 1000,
+                "opencode_providers": [
+                    {
+                        "name": "minimax",
+                        "enabled": True,
+                        "base_url": "https://api.minimax.io/v1",
+                        "api_key": "",
+                        "clear_api_key": True,
+                        "models": ["minimax-text-01"],
+                        "headers": {},
+                        "options": {},
+                    }
+                ],
+            },
+        )
+        assert response_clear.status_code == 200
+        cfg_clear = web_main._cfg_get()
+        assert cfg_clear.opencode_providers[0].api_key == "test-minimax-key"
+
+
+def test_put_config_allows_disabling_docker_flag_in_native_mode():
+    with TestClient(web_main.app) as client:
+        response = client.put(
+            "/api/config",
+            json={
+                "fuzz_use_docker": False,
+                "fuzz_time_budget": 900,
+                "fuzz_docker_image": "auto",
+            },
+        )
+
+    assert response.status_code == 200
+    cfg = web_main._cfg_get()
+    assert cfg.fuzz_use_docker is False
+
+
+def test_put_config_accepts_unlimited_budget_zero():
+    with TestClient(web_main.app) as client:
+        response = client.put(
+            "/api/config",
+            json={
+                "fuzz_use_docker": False,
+                "fuzz_time_budget": 0,
+                "fuzz_docker_image": "",
+            },
+        )
+
+    assert response.status_code == 200
+    cfg = web_main._cfg_get()
+    assert cfg.fuzz_time_budget == 0
+
+
+def test_put_config_accepts_lightweight_api_base_url_payload():
+    with TestClient(web_main.app) as client:
+        response = client.put("/api/config", json={"apiBaseUrl": "http://localhost:8001"})
+
+    assert response.status_code == 200
+    cfg = web_main._cfg_get()
+    assert cfg.api_base_url == "http://localhost:8001"
+
+
+def test_put_config_rejects_negative_budget():
+    with TestClient(web_main.app) as client:
+        response = client.put(
+            "/api/config",
+            json={
+                "fuzz_use_docker": False,
+                "fuzz_time_budget": -1,
+                "fuzz_docker_image": "",
+            },
+        )
+
+    assert response.status_code == 400
+    assert "fuzz_time_budget must be >= 0" in response.json().get("detail", "")
+
+
+def test_get_opencode_provider_models_supports_glm_alias():
+    with TestClient(web_main.app) as client:
+        response = client.get("/api/opencode/providers/glm/models")
+
+    assert response.status_code == 404
+
+
+def test_get_opencode_provider_models_rejects_unknown_provider():
+    with TestClient(web_main.app) as client:
+        response = client.get("/api/opencode/providers/unknown/models")
+
+    assert response.status_code == 404
+
+
+def test_post_opencode_provider_models_uses_request_overrides(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake(provider, cfg, *, api_key_override=None, base_url_override=None):
+        captured["provider"] = provider
+        captured["api_key_override"] = api_key_override
+        captured["base_url_override"] = base_url_override
+        return "minimax", ["MiniMax-M2.7-highspeed"], "remote", ""
+
+    monkeypatch.setattr(web_main, "list_opencode_provider_models_resolved", _fake)
+
+    with TestClient(web_main.app) as client:
+        response = client.post(
+            "/api/opencode/providers/minimax/models",
+            json={
+                "api_key": "minimax-test-key",
+                "base_url": "https://api.minimaxi.com/anthropic/v1",
+            },
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["provider"] == "minimax"
+    assert data["models"] == ["MiniMax-M2.7-highspeed"]
+    assert data["source"] == "remote"
+    assert captured["provider"] == "minimax"
+    assert captured["api_key_override"] == "minimax-test-key"
+    assert captured["base_url_override"] == "https://api.minimaxi.com/anthropic/v1"
+
+
+def test_model_listing_does_not_cross_use_openai_key_for_other_provider():
+    cfg = WebPersistentConfig(
+        openai_api_key="openrouter-key",
+        openai_base_url="https://openrouter.ai/api/v1",
+        opencode_providers=[
+            OpencodeProviderConfig(
+                name="deepseek",
+                enabled=True,
+                api_key=None,
+                base_url="https://api.deepseek.com/v1",
+            )
+        ],
+    )
+
+    normalized, models, source, warning = list_opencode_provider_models_resolved("deepseek", cfg)
+    assert normalized == "deepseek"
+    assert source == "none"
+    assert models == []
+    assert "unsupported provider" in warning
+
+
+def test_build_opencode_runtime_config_uses_local_mcp_command_array():
+    cfg = WebPersistentConfig(
+        opencode_providers=[
+            OpencodeProviderConfig(
+                name="minimax",
+                enabled=True,
+                base_url="https://api.minimaxi.com/anthropic/v1",
+                api_key="dummy",
+                models=["MiniMax-M2.7-highspeed"],
+            )
+        ]
+    )
+    payload = build_opencode_runtime_config(cfg)
+    assert "mcp" not in payload
+
+
+def test_task_submit_no_auto_init_is_successful_and_does_not_crash(monkeypatch):
+    def _fake_submit(job, _cfg):
+        child_id = web_main._create_job("fuzz", job.code_url)
+        web_main._job_update(child_id, status="success", result="ok", finished_at=time.time())
+        return child_id
+
+    monkeypatch.setattr(web_main, "_submit_fuzz_job", _fake_submit)
+
+    with TestClient(web_main.app) as client:
+        response = client.post(
+            "/api/task",
+            json={
+                "jobs": [{"code_url": "https://github.com/example/repo.git"}],
+                "auto_init": False,
+            },
+        )
+        assert response.status_code == 200
+        job_id = response.json()["job_id"]
+        status = client.get(f"/api/task/{job_id}").json()
+
+    assert status["status"] == "success"
+    assert status["finished_at"] is not None
+
+
+def test_task_submit_child_spawn_happens_outside_parent_stdout_redirect(monkeypatch):
+    observed_parent_redirect_flags: list[bool] = []
+
+    def _fake_submit(job, _cfg):
+        observed_parent_redirect_flags.append(isinstance(sys.stdout, web_main._Tee))
+        child_id = web_main._create_job("fuzz", job.code_url)
+        web_main._job_update(child_id, status="running")
+        return child_id
+
+    monkeypatch.setattr(web_main, "_submit_fuzz_job", _fake_submit)
+
+    with TestClient(web_main.app) as client:
+        response = client.post(
+            "/api/task",
+            json={
+                "jobs": [{"code_url": "https://github.com/example/repo.git"}],
+                "auto_init": False,
+            },
+        )
+        assert response.status_code == 200
+        job_id = response.json()["job_id"]
+        status = client.get(f"/api/task/{job_id}").json()
+
+    assert observed_parent_redirect_flags == [False]
+    assert status["status"] == "running"
+
+
+def test_task_submit_allows_non_docker_job_in_native_mode(monkeypatch):
+    def _fake_submit(job, _cfg):
+        child_id = web_main._create_job("fuzz", job.code_url)
+        web_main._job_update(child_id, status="running")
+        return child_id
+
+    monkeypatch.setattr(web_main, "_submit_fuzz_job", _fake_submit)
+
+    with TestClient(web_main.app) as client:
+        response = client.post(
+            "/api/task",
+            json={
+                "jobs": [
+                    {
+                        "code_url": "https://github.com/example/repo.git",
+                        "docker": False,
+                    }
+                ],
+                "auto_init": False,
+            },
+        )
+
+    assert response.status_code == 200
+
+
+
+def test_task_submit_accepts_unlimited_total_and_run_budget(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake_fuzz_logic(*args, **kwargs):
+        captured["time_budget"] = kwargs.get("time_budget")
+        captured["run_time_budget"] = kwargs.get("run_time_budget")
+        return "ok"
+
+    monkeypatch.setattr(web_main, "fuzz_logic", _fake_fuzz_logic)
+
+    with TestClient(web_main.app) as client:
+        response = client.post(
+            "/api/task",
+            json={
+                "jobs": [
+                    {
+                        "code_url": "https://github.com/example/repo.git",
+                        "total_time_budget": 0,
+                        "run_time_budget": 0,
+                    }
+                ],
+                "auto_init": False,
+            },
+        )
+        assert response.status_code == 200
+        task_id = response.json()["job_id"]
+        status = client.get(f"/api/task/{task_id}").json()
+
+    assert status["status"] == "success"
+    assert captured["time_budget"] == 0
+    assert captured["run_time_budget"] == 0
+
+
+def test_task_detail_preserves_fix_build_metadata_in_result(monkeypatch):
+    def _fake_fuzz_logic(*args, **kwargs):
+        return {
+            "message": "done",
+            "fix_build_terminal_reason": "fix_build_noop_streak_exceeded",
+            "fix_build_noop_streak": 3,
+            "fix_build_rule_hits": ["compiler_fuzzer_flag_mismatch"],
+        }
+
+    monkeypatch.setattr(web_main, "fuzz_logic", _fake_fuzz_logic)
+
+    with TestClient(web_main.app) as client:
+        response = client.post(
+            "/api/task",
+            json={
+                "jobs": [{"code_url": "https://github.com/example/repo.git"}],
+                "auto_init": False,
+            },
+        )
+        assert response.status_code == 200
+        task_id = response.json()["job_id"]
+        status = client.get(f"/api/task/{task_id}").json()
+
+    assert status["status"] == "success"
+    children = status.get("children") or []
+    assert len(children) == 1
+    result = children[0].get("result") or {}
+    assert result.get("fix_build_terminal_reason") == "fix_build_noop_streak_exceeded"
+    assert result.get("fix_build_noop_streak") == 3
+
+
+def test_task_detail_preserves_run_metadata_in_result(monkeypatch):
+    def _fake_fuzz_logic(*args, **kwargs):
+        return {
+            "message": "done",
+            "run_terminal_reason": "run_idle_timeout",
+            "run_idle_seconds": 120,
+            "run_children_exit_count": 2,
+        }
+
+    monkeypatch.setattr(web_main, "fuzz_logic", _fake_fuzz_logic)
+
+    with TestClient(web_main.app) as client:
+        response = client.post(
+            "/api/task",
+            json={
+                "jobs": [{"code_url": "https://github.com/example/repo.git"}],
+                "auto_init": False,
+            },
+        )
+        assert response.status_code == 200
+        task_id = response.json()["job_id"]
+        status = client.get(f"/api/task/{task_id}").json()
+
+    assert status["status"] == "success"
+    children = status.get("children") or []
+    assert len(children) == 1
+    result = children[0].get("result") or {}
+    assert result.get("run_terminal_reason") == "run_idle_timeout"
+    assert result.get("run_idle_seconds") == 120
+    assert result.get("run_children_exit_count") == 2
+
+
+def test_task_api_accepts_duration_alias_fields_and_unlimited_mapping(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def _fake_fuzz_logic(*args, **kwargs):
+        captured["time_budget"] = kwargs.get("time_budget")
+        captured["run_time_budget"] = kwargs.get("run_time_budget")
+        return {"ok": True}
+
+    monkeypatch.setattr(web_main, "fuzz_logic", _fake_fuzz_logic)
+
+    with TestClient(web_main.app) as client:
+        response = client.post(
+            "/api/task",
+            json={
+                "jobs": [
+                    {
+                        "code_url": "https://github.com/example/repo.git",
+                        "total_duration": -1,
+                        "single_duration": -1,
+                        "max_tokens": 0,
+                        "unlimited_round_limit": 7200,
+                    }
+                ],
+                "auto_init": False,
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured.get("time_budget") == 0
+    assert captured.get("run_time_budget") == 0
+
+
+def test_list_tasks_returns_recent_tasks_with_child_summary():
+    task_old = web_main._create_job("task", "batch")
+    time.sleep(0.001)
+    task_new = web_main._create_job("task", "batch")
+    child = web_main._create_job("fuzz", "https://github.com/example/repo.git")
+    web_main._job_update(task_new, children=[child], status="running")
+    web_main._job_update(child, status="running")
+
+    with TestClient(web_main.app) as client:
+        response = client.get("/api/tasks?limit=10")
+
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert len(items) == 2
+    assert items[0]["job_id"] == task_new
+    assert items[0]["status"] == "RUNNING"
+    assert items[0]["status_raw"] == "running"
+    assert items[0]["id"] == task_new
+    assert items[0]["stage"] == "RUNNING"
+    assert isinstance(items[0]["progress"], int)
+    assert items[0]["child_count"] == 1
+    assert items[0]["children_status"]["running"] == 1
+    assert items[1]["job_id"] == task_old
+
+
+def test_list_tasks_exposes_vuln_hunting_fields_from_active_child():
+    task_id = web_main._create_job("task", "batch")
+    child_id = web_main._create_job("fuzz", "https://github.com/example/repo.git")
+    web_main._job_update(
+        child_id,
+        status="running",
+        security_evidence_count=9,
+        vuln_candidate_count=4,
+        vuln_hunting_enabled=True,
+        security_priority_mode=True,
+        latest_vuln_decision_snapshot={
+            "kind": "choose_target",
+            "selected_target": "parse_zip",
+        },
+    )
+    web_main._job_update(task_id, children=[child_id], status="running")
+
+    with TestClient(web_main.app) as client:
+        listing = client.get("/api/tasks?limit=5").json()["items"]
+        detail = client.get(f"/api/task/{task_id}").json()
+
+    assert listing[0]["job_id"] == task_id
+    assert listing[0]["security_evidence_count"] == 9
+    assert listing[0]["vuln_candidate_count"] == 4
+    assert listing[0]["vuln_hunting_enabled"] is True
+    assert listing[0]["security_priority_mode"] is True
+    assert listing[0]["latest_vuln_decision_snapshot"]["selected_target"] == "parse_zip"
+    assert detail["children"][0]["security_evidence_count"] == 9
+    assert detail["children"][0]["vuln_candidate_count"] == 4
+    assert detail["children"][0]["vuln_hunting_enabled"] is True
+    assert detail["children"][0]["security_priority_mode"] is True
+
+
+def test_list_tasks_applies_limit_and_filters_non_task_jobs():
+    web_main._create_job("fuzz", "https://github.com/example/repo.git")
+    web_main._create_job("task", "batch")
+    time.sleep(0.001)
+    task_latest = web_main._create_job("task", "batch")
+
+    with TestClient(web_main.app) as client:
+        response = client.get("/api/tasks?limit=1")
+
+    assert response.status_code == 200
+    items = response.json()["items"]
+    assert len(items) == 1
+    assert items[0]["job_id"] == task_latest
+
+
+def test_list_tasks_exposes_error_code_for_task_and_children():
+    task_id = web_main._create_job("task", "batch")
+    child_id = web_main._create_job("fuzz", "https://github.com/example/repo.git")
+    web_main._job_update(
+        child_id,
+        status="error",
+        result={"build_error_code": "missing_llvmfuzzer_entrypoint"},
+    )
+    web_main._job_update(task_id, children=[child_id], status="error")
+
+    with TestClient(web_main.app) as client:
+        task = client.get(f"/api/task/{task_id}").json()
+        listing = client.get("/api/tasks?limit=5").json()["items"]
+
+    assert task["error_code"] == "unknown_error"
+    assert task["error"]["code"] == "unknown_error"
+    assert task["phase"] == "error"
+    assert task["children"][0]["error_code"] == "missing_llvmfuzzer_entrypoint"
+    assert task["children"][0]["error"]["code"] == "missing_llvmfuzzer_entrypoint"
+    assert task["children"][0]["phase"] == "error"
+    assert listing[0]["job_id"] == task_id
+    assert listing[0]["error_code"] == "unknown_error"
+    assert listing[0]["error"]["code"] == "unknown_error"
+    assert listing[0]["phase"] == "error"
+
+
+def test_list_tasks_displays_real_repo_for_batch_tasks():
+    task_id = web_main._create_job("task", "batch")
+    web_main._job_update(
+        task_id,
+        request={
+            "jobs": [
+                {"code_url": "https://github.com/example/repo-a.git"},
+                {"code_url": "https://github.com/example/repo-b.git"},
+            ]
+        },
+    )
+
+    with TestClient(web_main.app) as client:
+        listing = client.get("/api/tasks?limit=5").json()["items"]
+
+    assert listing[0]["job_id"] == task_id
+    assert listing[0]["repo"] == "repo-a (+1 more)"
+    assert listing[0]["repo_raw"] == "batch"
+
+
+def test_system_status_contains_dynamic_frontend_blocks():
+    task_id = web_main._create_job("task", "batch")
+    child_id = web_main._create_job("fuzz", "https://github.com/example/repo.git")
+    web_main._job_update(task_id, status="running", children=[child_id])
+    now = time.time()
+    web_main._job_update(
+        child_id,
+        status="success",
+        finished_at=now,
+        updated_at=now,
+        result={
+            "coverage_percent": 63.2,
+            "llm_usage": {"prompt_tokens": 1200, "completion_tokens": 800},
+        },
+        request={"max_tokens": 1000},
+    )
+
+    with TestClient(web_main.app) as client:
+        _ = client.get("/api/tasks")
+        response = client.get("/api/system")
+
+    assert response.status_code == 200
+    doc = response.json()
+    assert "overview" in doc
+    assert "telemetry" in doc
+    assert "execution" in doc and "summary" in doc["execution"]
+    assert "tasks_tab_metrics" in doc
+    assert "total_jobs" in doc["tasks_tab_metrics"]
+    assert "success_rate" in doc["tasks_tab_metrics"]
+    assert isinstance(doc["telemetry"].get("performance_series"), list)
+    # No hardcoded placeholder constants should leak from /api/system.
+    assert doc["overview"].get("avg_fuzz_time") != "42m"
+    assert doc["overview"].get("avg_coverage") != "68.4"
+    assert doc["telemetry"].get("llm_token_usage") != "N/A"
+    assert doc["execution"]["summary"].get("avg_triage_time_ms") != "482"
+    assert doc["overview"].get("cluster_health") is not None
+    assert doc["overview"].get("avg_coverage") is not None
+    assert doc["telemetry"].get("llm_token_usage") is not None
+    assert doc["telemetry"].get("fastapi_gateway") is not None
+
+
+def test_system_status_execs_per_sec_reads_run_log_metrics(tmp_path: Path):
+    job_id = web_main._create_job("fuzz", "https://github.com/example/repo.git")
+    log_path = tmp_path / f"{job_id}.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "[run] warming up",
+                "stat::average_exec_per_sec: 7681",
+                "stat::average_exec_per_sec: 9123",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    web_main._job_update(job_id, status="running", log_file=str(log_path), log="")
+
+    with TestClient(web_main.app) as client:
+        response = client.get("/api/system")
+
+    assert response.status_code == 200
+    doc = response.json()
+    assert doc["tasks_tab_metrics"]["execs_per_sec"] == "9.1"
+
+def test_system_status_execs_per_sec_falls_back_to_recent_success_window(tmp_path: Path):
+    job_id = web_main._create_job("fuzz", "https://github.com/example/repo.git")
+    log_path = tmp_path / f"{job_id}.log"
+    log_path.write_text(
+        "\n".join(
+            [
+                "[run] completed",
+                "stat::average_exec_per_sec: 12450",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    now = time.time()
+    web_main._job_update(
+        job_id,
+        status="success",
+        finished_at=now - 7200,  # 2h ago: outside 5m window but inside fallback window
+        updated_at=now - 7200,
+        log_file=str(log_path),
+        log="",
+    )
+
+    with TestClient(web_main.app) as client:
+        response = client.get("/api/system")
+
+    assert response.status_code == 200
+    doc = response.json()
+    assert doc["tasks_tab_metrics"]["execs_per_sec"] == "12.4"
+def test_system_status_llm_token_usage_requires_real_token_fields(tmp_path: Path):
+    job_id = web_main._create_job("fuzz", "https://github.com/example/repo.git")
+    log_path = tmp_path / f"{job_id}.log"
+    log_path.write_text("[run] no token stats here\n", encoding="utf-8")
+    web_main._job_update(job_id, status="success", finished_at=time.time(), updated_at=time.time(), log_file=str(log_path), log="")
+
+    with TestClient(web_main.app) as client:
+        response = client.get("/api/system")
+
+    assert response.status_code == 200
+    doc = response.json()
+    assert doc["telemetry"]["llm_token_usage"] is None
+    assert doc["telemetry"]["llm_token_status"] == "--"
+
+
+def test_system_status_separates_main_task_and_child_job_counts():
+    task_job = web_main._create_job("task", "batch")
+    child_job = web_main._create_job("fuzz", "https://github.com/example/repo.git")
+    web_main._job_update(task_job, status="queued")
+    web_main._job_update(child_job, status="queued")
+
+    with TestClient(web_main.app) as client:
+        response = client.get("/api/system")
+
+    assert response.status_code == 200
+    doc = response.json()
+    assert doc["overview"]["main_tasks_queued"] == "1"
+    assert doc["overview"]["child_jobs_queued"] == "1"
+    assert doc["execution"]["summary"]["repos_queued"] == "1"
+
+
+def test_api_metrics_contains_job_counters():
+    task_id = web_main._create_job("task", "batch")
+    child_a = web_main._create_job("fuzz", "https://github.com/example/repo-a.git")
+    child_b = web_main._create_job("fuzz", "https://github.com/example/repo-b.git")
+    now = time.time()
+    web_main._job_update(child_a, status="success", finished_at=now)
+    web_main._job_update(child_b, status="error", finished_at=now)
+    web_main._job_update(task_id, status="running", children=[child_a, child_b])
+
+    with TestClient(web_main.app) as client:
+        response = client.get("/api/metrics")
+
+    assert response.status_code == 200
+    body = response.text
+    assert "sherpa_jobs_total " in body
+    assert 'sherpa_jobs_status{status="running"} ' in body
+    assert 'sherpa_jobs_status{status="error"} ' in body
+    assert "sherpa_jobs_failure_rate_window " in body
+
+
+def test_resume_task_resumes_recoverable_child_job(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_main, "fuzz_logic", lambda *args, **kwargs: {"ok": True})
+
+    task_id = web_main._create_job("task", "batch")
+    child_id = web_main._create_job("fuzz", "https://github.com/example/repo.git")
+    web_main._job_update(
+        child_id,
+        status="recoverable",
+        request={"code_url": "https://github.com/example/repo.git"},
+        resume_from_step="run",
+        workflow_repo_root=str(tmp_path),
+        resume_repo_root=str(tmp_path),
+        parent_id=task_id,
+    )
+    web_main._job_update(task_id, status="recoverable", children=[child_id])
+
+    with TestClient(web_main.app) as client:
+        response = client.post(f"/api/task/{task_id}/resume")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["accepted"] is True
+        task = client.get(f"/api/task/{task_id}").json()
+
+    child = web_main._job_snapshot(child_id)
+    assert child is not None
+    assert child["status"] == "resumed"
+    assert isinstance(child["result"], dict)
+    assert child["result"].get("ok") is True
+    assert isinstance(child["result"].get("stage_results"), list)
+    assert child["result"].get("stage_job_names")
+    assert task["status"] == "success"
+
+
+def test_resume_task_missing_child_request_marks_resume_failed(monkeypatch):
+    monkeypatch.setattr(web_main, "fuzz_logic", lambda *args, **kwargs: {"ok": True})
+
+    task_id = web_main._create_job("task", "batch")
+    child_id = web_main._create_job("fuzz", "https://github.com/example/repo.git")
+    web_main._job_update(child_id, status="recoverable", parent_id=task_id)
+    web_main._job_update(task_id, status="recoverable", children=[child_id])
+
+    with TestClient(web_main.app) as client:
+        response = client.post(f"/api/task/{task_id}/resume")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["accepted"] is False
+        assert data["reason"] == "no_resumable_children"
+
+    child = web_main._job_snapshot(child_id)
+    assert child is not None
+    assert child["status"] == "resume_failed"
+    assert child.get("resume_error_code") == "missing_resume_context"
+
+
+def test_resume_task_request_is_idempotent(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(web_main, "fuzz_logic", lambda *args, **kwargs: "ok")
+
+    task_id = web_main._create_job("task", "batch")
+    child_id = web_main._create_job("fuzz", "https://github.com/example/repo.git")
+    web_main._job_update(
+        child_id,
+        status="recoverable",
+        request={"code_url": "https://github.com/example/repo.git"},
+        resume_from_step="run",
+        workflow_repo_root=str(tmp_path),
+        resume_repo_root=str(tmp_path),
+        parent_id=task_id,
+    )
+    web_main._job_update(task_id, status="recoverable", children=[child_id])
+
+    with TestClient(web_main.app) as client:
+        first = client.post(f"/api/task/{task_id}/resume").json()
+        second = client.post(f"/api/task/{task_id}/resume").json()
+
+    assert first["accepted"] is True
+    assert second["accepted"] is False
+    assert second["reason"] in {"already_completed", "no_resumable_children", "already_in_progress"}
+
+
+def test_resume_fuzz_job_uses_saved_resume_step_and_repo(monkeypatch, tmp_path: Path):
+    captured: dict[str, object] = {}
+
+    def _fake_fuzz_logic(*args, **kwargs):
+        captured.update(kwargs)
+        return "ok"
+
+    monkeypatch.setattr(web_main, "fuzz_logic", _fake_fuzz_logic)
+
+    child_id = web_main._create_job("fuzz", "https://github.com/example/repo.git")
+    web_main._job_update(
+        child_id,
+        status="recoverable",
+        request={"code_url": "https://github.com/example/repo.git"},
+        resume_from_step="run",
+        workflow_repo_root=str(tmp_path),
+        resume_repo_root=str(tmp_path),
+    )
+
+    with TestClient(web_main.app) as client:
+        response = client.post(f"/api/task/{child_id}/resume")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["accepted"] is True
+        assert body["kind"] == "fuzz"
+
+    assert captured.get("resume_from_step") == "run"
+    assert str(captured.get("resume_repo_root")) == str(tmp_path)
+
+
+def test_stop_fuzz_job_marks_error_and_cancel_requested(monkeypatch):
+    job_id = web_main._create_job("fuzz", "https://github.com/example/repo.git")
+    web_main._job_update(job_id, status="running", workflow_repo_root="/tmp/repo")
+
+    monkeypatch.setattr(web_main, "_cancel_job_future", lambda _: True)
+    monkeypatch.setattr(web_main, "_stop_runtime_containers_for_repo", lambda _: ["cid-1"])
+
+    with TestClient(web_main.app) as client:
+        response = client.post(f"/api/task/{job_id}/stop")
+        assert response.status_code == 200
+        body = response.json()
+
+    snap = web_main._job_snapshot(job_id)
+    assert snap is not None
+    assert body["accepted"] is True
+    assert body["kind"] == "fuzz"
+    assert body["reason"] == "stopped"
+    assert body["details"]["future_cancelled"] is True
+    assert body["details"]["killed_containers"] == ["cid-1"]
+    assert snap["status"] == "error"
+    assert snap["cancel_requested"] is True
+    assert snap["error"] == "cancelled by user"
+
+
+def test_stop_task_job_stops_children(monkeypatch):
+    task_id = web_main._create_job("task", "batch")
+    child_id = web_main._create_job("fuzz", "https://github.com/example/repo.git")
+    web_main._job_update(task_id, status="running", children=[child_id])
+    web_main._job_update(child_id, status="running", parent_id=task_id, workflow_repo_root="/tmp/repo")
+
+    monkeypatch.setattr(web_main, "_cancel_job_future", lambda _: True)
+    monkeypatch.setattr(web_main, "_stop_runtime_containers_for_repo", lambda _: ["cid-child"])
+
+    with TestClient(web_main.app) as client:
+        response = client.post(f"/api/task/{task_id}/stop")
+        assert response.status_code == 200
+        body = response.json()
+
+    task_snap = web_main._job_snapshot(task_id)
+    child_snap = web_main._job_snapshot(child_id)
+    assert task_snap is not None
+    assert child_snap is not None
+    assert body["accepted"] is True
+    assert body["kind"] == "task"
+    assert body["reason"] == "stopped"
+    assert body["status"] == "error"
+    assert body["details"]["parent_future_cancelled"] is True
+    assert len(body["details"]["stopped_children"]) == 1
+    assert body["details"]["stopped_children"][0]["accepted"] is True
+    assert task_snap["status"] == "error"
+    assert task_snap["cancel_requested"] is True
+    assert child_snap["status"] == "error"
+    assert child_snap["cancel_requested"] is True
+    assert child_snap["error"] == "cancelled by user"
+
+
+def test_stop_task_job_not_found_returns_rejected():
+    with TestClient(web_main.app) as client:
+        response = client.post("/api/task/not-found/stop")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["accepted"] is False
+    assert body["reason"] == "job_not_found"
+
+
+def test_ensure_docker_image_buildkit_fallback_uses_classic_builder_without_progress(monkeypatch, tmp_path: Path):
+    dockerfile = tmp_path / "Dockerfile"
+    dockerfile.write_text("FROM scratch\n", encoding="utf-8")
+
+    calls: list[tuple[list[str], str | None]] = []
+    scenarios = [
+        (1, "ERROR: BuildKit is enabled but the buildx component is missing or broken.\n"),
+        (0, "Successfully built image.\n"),
+    ]
+
+    class _FakeProc:
+        def __init__(self, output: str, rc: int):
+            self.stdout = io.StringIO(output)
+            self.returncode: int | None = None
+            self._rc = rc
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout: float | None = None):
+            self.returncode = self._rc
+            return self._rc
+
+    def _fake_run(cmd, *args, **kwargs):
+        if list(cmd[:2]) == ["docker", "info"]:
+            return SimpleNamespace(returncode=0)
+        if list(cmd[:3]) == ["docker", "image", "inspect"]:
+            return SimpleNamespace(returncode=1)
+        return SimpleNamespace(returncode=0)
+
+    def _fake_popen(cmd, *args, **kwargs):
+        env = kwargs.get("env") or {}
+        calls.append((list(cmd), env.get("DOCKER_BUILDKIT")))
+        if not scenarios:
+            raise AssertionError("unexpected docker build invocation")
+        rc, out = scenarios.pop(0)
+        return _FakeProc(out, rc)
+
+    monkeypatch.setattr(web_main.subprocess, "run", _fake_run)
+    monkeypatch.setattr(web_main.subprocess, "Popen", _fake_popen)
+
+    web_main._ensure_docker_image("test:image", dockerfile, force=True)
+
+    assert len(calls) >= 2
+    assert any(
+        buildkit == "0" and not any(arg.startswith("--progress=") for arg in cmd)
+        for cmd, buildkit in calls
+    )

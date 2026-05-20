@@ -1,0 +1,113 @@
+name: PR Summary
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: pr-summary-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  pr-summary:
+    name: Build PR Summary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect changed files
+        id: files
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          git diff --name-only "$base" "$head" > changed_files.txt
+          total="$(wc -l < changed_files.txt | tr -d ' ')"
+          docs_count="$(grep -Ec '^(README\.md|docs/|assets/)' changed_files.txt || true)"
+          backend_count="$(grep -Ec '^(harness_generator/|tests/|docker/|docker-compose\.yml|\.env\.example|Makefile)' changed_files.txt || true)"
+          frontend_count="$(grep -Ec '^(frontend-next/|docker/nginx/)' changed_files.txt || true)"
+
+          if [[ "$total" == "0" ]]; then
+            docs_only="false"
+          elif [[ "$docs_count" == "$total" ]]; then
+            docs_only="true"
+          else
+            docs_only="false"
+          fi
+
+          {
+            echo "total=$total"
+            echo "docs_count=$docs_count"
+            echo "backend_count=$backend_count"
+            echo "frontend_count=$frontend_count"
+            echo "docs_only=$docs_only"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build markdown summary
+        id: summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          total='${{ steps.files.outputs.total }}'
+          docs_count='${{ steps.files.outputs.docs_count }}'
+          backend_count='${{ steps.files.outputs.backend_count }}'
+          frontend_count='${{ steps.files.outputs.frontend_count }}'
+          docs_only='${{ steps.files.outputs.docs_only }}'
+
+          {
+            echo "## PR Summary"
+            echo
+            echo "- total changed files: \`$total\`"
+            echo "- docs/assets changed files: \`$docs_count\`"
+            echo "- backend related files: \`$backend_count\`"
+            echo "- frontend related files: \`$frontend_count\`"
+            echo "- docs/assets only: \`$docs_only\`"
+            echo
+            echo "### Changed Files (top 200)"
+            echo
+            sed -n '1,200p' changed_files.txt | sed 's/^/- /'
+          } > pr_summary.md
+
+          cat pr_summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upsert PR comment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const marker = '<!-- sherpa-pr-summary -->';
+            const body = fs.readFileSync('pr_summary.md', 'utf8');
+            const fullBody = `${marker}\n${body}`;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body: fullBody,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body: fullBody,
+              });
+            }
