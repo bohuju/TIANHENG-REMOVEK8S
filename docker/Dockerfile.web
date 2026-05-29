@@ -142,6 +142,10 @@ RUN set -e; \
     chmod +x /usr/local/bin/docker; \
     docker --version
 
+# GBrain MCP wrapper: bun + gbrain source are mounted via docker-compose volumes.
+RUN printf '#!/usr/local/bin/bun\nimport "/opt/gbrain/src/cli.ts";\n' > /usr/local/bin/gbrain \
+    && chmod +x /usr/local/bin/gbrain
+
 COPY docker/requirements.web.txt /app/docker/requirements.web.txt
 RUN python -m pip install -r /app/docker/requirements.web.txt
 

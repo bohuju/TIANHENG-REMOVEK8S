@@ -44,6 +44,10 @@ services:
 
       # (Optional) mount a local .env containing API keys (OPENAI_API_KEY / OPENROUTER_API_KEY).
       # - ./.env:/app/.env:ro
+
+      # gbrain source + bun for MCP memory server
+      - /home/bohuju/self_project/gbrain:/opt/gbrain:ro
+      - /home/bohuju/.bun/bin/bun:/usr/local/bin/bun:ro
     environment:
       # Make Uvicorn bind for container networking (main.py reads these).
       HOST: "0.0.0.0"
@@ -78,6 +82,7 @@ services:
       OPENCODE_CONFIG: "/tmp/sherpa-runtime/opencode.generated.json"
       SHERPA_WEB_JOB_LOG_DIR: "/app/job-logs/jobs"
       DATABASE_URL: ${DATABASE_URL:-postgresql://sherpa:sherpa@postgres:5432/sherpa}
+      GBRAIN_DATABASE_URL: ${GBRAIN_DATABASE_URL:-postgresql://postgres:postgres@gbrain-postgres:5432/gbrain_mcp}
 
       # Optional (fuzz patching): where to read API key env file from.
       # AI_KEY_PATH: "/app/.env"
@@ -106,6 +111,25 @@ services:
       start_period: 10s
     volumes:
       - sherpa-postgres-data:/var/lib/postgresql/data
+
+  # Dedicated Postgres for GBrain long-term memory.
+  gbrain-postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: gbrain_mcp
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d gbrain_mcp"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    volumes:
+      - sherpa-gbrain-data:/var/lib/postgresql/data
 
   # Docker daemon sidecar (dind): build/run fuzz runtime containers.
   sherpa-docker:
@@ -216,4 +240,5 @@ volumes:
   sherpa-tmp:
   sherpa-config:
   sherpa-job-logs:
+  sherpa-gbrain-data:
   sherpa-postgres-data:
