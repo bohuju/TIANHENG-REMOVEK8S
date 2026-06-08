@@ -142,9 +142,28 @@ RUN set -e; \
     chmod +x /usr/local/bin/docker; \
     docker --version
 
-# GBrain MCP wrapper: bun + gbrain source are mounted via docker-compose volumes.
-RUN printf '#!/usr/local/bin/bun\nimport "/opt/gbrain/src/cli.ts";\n' > /usr/local/bin/gbrain \
-    && chmod +x /usr/local/bin/gbrain
+# Install Bun runtime (for GBrain MCP memory server).
+ARG BUN_VERSION=1.2.0
+RUN set -e; \
+    arch="${TARGETARCH:-$(dpkg --print-architecture)}"; \
+    case "$arch" in \
+        amd64|x86_64) bun_arch="x64" ;; \
+        arm64|aarch64) bun_arch="aarch64" ;; \
+        *) echo "Unsupported architecture for Bun: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-${bun_arch}.zip" -o /tmp/bun.zip; \
+    unzip -o /tmp/bun.zip -d /usr/local/bin bun-linux-${bun_arch}/bun; \
+    mv /usr/local/bin/bun-linux-${bun_arch}/bun /usr/local/bin/bun; \
+    rmdir /usr/local/bin/bun-linux-${bun_arch}; \
+    rm -f /tmp/bun.zip; \
+    chmod +x /usr/local/bin/bun; \
+    bun --version
+
+# Copy GBrain source and install dependencies (self-contained, no volume mount needed).
+COPY gbrain /opt/gbrain
+RUN cd /opt/gbrain && bun install --production && \
+    printf '#!/usr/local/bin/bun\nimport "/opt/gbrain/src/cli.ts";\n' > /usr/local/bin/gbrain && \
+    chmod +x /usr/local/bin/gbrain
 
 COPY docker/requirements.web.txt /app/docker/requirements.web.txt
 RUN python -m pip install -r /app/docker/requirements.web.txt

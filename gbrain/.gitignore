@@ -1,0 +1,15 @@
+node_modules/
+bin/
+.DS_Store
+*.log
+.env
+.env.*
+!.env.*.example
+# Bun --compile temp artifacts. Each build emits a new hash-named .bun-build
+# file in cwd; glob catches all of them.
+*.bun-build
+.gstack/
+supabase/.temp/
+.claude/skills/
+.idea
+eval/reports/

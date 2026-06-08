@@ -46,3 +46,8 @@ frontend-next/.next/
 frontend-next/coverage/
 
 /.claude/worktrees
+
+# gbrain build artifacts (installed during Docker image build)
+gbrain/node_modules/
+gbrain/bin/
+gbrain/.gitnexus/

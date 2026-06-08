@@ -210,6 +210,44 @@ clone_cmd = [
 
 **补充说明**：[codex_helper.py](../harness_generator/src/codex_helper.py) 中 `_docker_git()` 方法使用的是 `--user 0:0`（root），因为 AI 修改文件需要跨越不同属主的文件——该场景与 clone 不同，各自有各自的用户策略。
 
+### 8. GBrain 记忆系统集成
+
+**现状**：GBrain 长期记忆系统已于 2026-06-01 完成优化并入镜像。gbrain 源码位于项目 `./gbrain/`，Bun 运行时和依赖在 Dockerfile 中安装，容器启动后零干预可用。
+
+**前置条件**：
+
+1. gbrain 数据库容器必须运行并接入同一 Docker 网络：
+   ```bash
+   sg docker -c "docker start gbrain-mcp-pg"
+   sg docker -c "docker network connect remove_k8s_default gbrain-mcp-pg"
+   ```
+2. Docker daemon DNS 必须可用（见问题 8 排查）。
+
+**验证**：
+```bash
+curl -s http://localhost:8000/api/memory/health | python3 -m json.tool
+# 期望 healthy: true, proc_alive: true
+```
+
+**文档**：详细优化方案与实施记录见 [`GBRAIN_OPTIMIZATION.md`](GBRAIN_OPTIMIZATION.md)。
+
+### 9. Docker 构建 DNS 解析失败
+
+**现象**：`docker compose build` 时 pip install / curl 报 `Temporary failure in name resolution` 或 `Could not resolve host`。
+
+**根因**：Docker daemon 继承的 DNS 服务器（从 `/etc/resolv.conf`）不可达。
+
+**修复**：在 `/etc/docker/daemon.json` 中指定公共 DNS：
+```json
+{"dns": ["8.8.8.8", "1.1.1.1"]}
+```
+然后重启 Docker：
+```bash
+sudo systemctl restart docker
+```
+
+---
+
 ## 日常维护
 
 ### 重启服务

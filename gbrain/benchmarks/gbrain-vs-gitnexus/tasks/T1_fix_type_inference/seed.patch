@@ -1,0 +1,3 @@
+# Seed patch for T1: fix_type_inference
+# No seed changes needed — this is a type-level bug present in the base repo.
+# The agent must identify and fix the type narrowing issue.

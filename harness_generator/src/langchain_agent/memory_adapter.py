@@ -92,6 +92,39 @@ class MemoryAdapter:
         self._call_lock: asyncio.Lock = asyncio.Lock()
         self._start_lock: asyncio.Lock = asyncio.Lock()
 
+        # Observability & resilience state
+        self._last_error: str = ""
+        self._last_error_time: float = 0.0
+        self._consecutive_failures: int = 0
+        self._healthy: bool = True  # optimistically healthy until first failure
+        self._max_retries: int = 3
+        self._retry_base_delay: float = 1.0  # seconds, multiplied by 2^attempt
+
+    def status(self) -> dict[str, Any]:
+        """Return health status for monitoring and API endpoints."""
+        proc_alive = self._proc is not None and self._proc.poll() is None
+        return {
+            "healthy": self._healthy and proc_alive,
+            "proc_alive": proc_alive,
+            "proc_pid": self._proc.pid if proc_alive else None,
+            "last_error": self._last_error or None,
+            "last_error_time": self._last_error_time or None,
+            "consecutive_failures": self._consecutive_failures,
+        }
+
+    def _record_error(self, message: str) -> None:
+        """Record an error and update health status."""
+        self._last_error = message
+        self._last_error_time = time.time()
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._max_retries:
+            self._healthy = False
+
+    def _record_success(self) -> None:
+        """Reset error tracking on a successful call."""
+        self._consecutive_failures = 0
+        self._healthy = True
+
     # ── process lifecycle ────────────────────────────────────────────
 
     async def _ensure_running(self) -> None:
@@ -121,12 +154,15 @@ class MemoryAdapter:
                 self._stderr_thread.start()
 
                 await asyncio.sleep(0.5)
+                self._record_success()
                 logger.info("GBrain MCP server started (pid={})", self._proc.pid)
             except FileNotFoundError:
-                logger.warning("gbrain command not found — memory features disabled")
+                self._record_error("gbrain command not found — memory features disabled")
+                logger.warning(self._last_error)
                 self._proc = None
             except Exception as exc:
-                logger.warning("Failed to start GBrain MCP server: {}", exc)
+                self._record_error(f"Failed to start GBrain MCP server: {exc}")
+                logger.warning(self._last_error)
                 self._proc = None
 
     def _drain_stderr(self) -> None:
@@ -175,49 +211,133 @@ class MemoryAdapter:
 
     # ── JSON-RPC core ────────────────────────────────────────────────
 
+    @staticmethod
+    def _unwrap_mcp_result(raw: dict[str, Any]) -> Any:
+        """Unpack MCP tools/call result.content[0].text into native Python objects.
+
+        The MCP protocol wraps tool return values inside
+        ``{"content": [{"type": "text", "text": "<json>"}]}``.
+        If ``text`` parses as JSON it is returned decoded; otherwise the
+        raw dict is returned unchanged.
+        """
+        content = raw.get("content")
+        if isinstance(content, list) and len(content) > 0:
+            text = content[0].get("text", "")
+            if isinstance(text, str) and text.strip():
+                try:
+                    return json.loads(text)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        # If raw is already a list (direct tool output from some servers), return as-is
+        return raw
+
     async def _call_tool(self, tool_name: str, arguments: dict[str, Any], timeout: float = 10.0) -> dict[str, Any]:
-        """Call a GBrain MCP tool via JSON-RPC over stdio."""
-        await self._ensure_running()
-        if self._proc is None or self._proc.stdin is None or self._proc.stdout is None:
-            return {"error": "GBrain MCP server not running"}
+        """Call a GBrain MCP tool via JSON-RPC over stdio.
 
-        async with self._call_lock:
-            self._request_id += 1
-            request = {
-                "jsonrpc": "2.0",
-                "id": self._request_id,
-                "method": "tools/call",
-                "params": {"name": tool_name, "arguments": arguments},
-            }
-            try:
-                payload = json.dumps(request) + "\n"
-                self._proc.stdin.write(payload)
-                self._proc.stdin.flush()
-            except Exception as exc:
-                logger.warning("GBrain MCP write error: {}", exc)
-                return {"error": str(exc)}
+        Retries with exponential backoff on transient failures (up to
+        self._max_retries times).  If the gbrain subprocess has died, it
+        will be restarted automatically before the next attempt.
+        """
+        last_result: dict[str, Any] = {"error": "GBrain MCP server not running"}
 
-            try:
-                line = await asyncio.wait_for(
-                    asyncio.get_event_loop().run_in_executor(None, self._proc.stdout.readline),
-                    timeout=timeout,
-                )
-                if not line:
-                    return {"error": "No response from GBrain MCP server"}
-                resp = json.loads(line)
-                # Propagate JSON-RPC protocol-level errors
-                if "error" in resp:
-                    err = resp["error"]
-                    return {"error": f"JSON-RPC error {err.get('code', '')}: {err.get('message', '')}"}
-                return resp.get("result", {})
-            except asyncio.TimeoutError:
-                logger.warning("GBrain MCP call {} timed out after {}s", tool_name, timeout)
-                return {"error": f"timeout after {timeout}s"}
-            except json.JSONDecodeError:
-                return {"error": "Invalid JSON response from GBrain"}
-            except Exception as exc:
-                logger.warning("GBrain MCP call {} error: {}", tool_name, exc)
-                return {"error": str(exc)}
+        for attempt in range(self._max_retries):
+            await self._ensure_running()
+            if self._proc is None or self._proc.stdin is None or self._proc.stdout is None:
+                if attempt < self._max_retries - 1:
+                    delay = self._retry_base_delay * (2 ** attempt)
+                    logger.warning("GBrain not running, retry {}/{} after {:.1f}s", attempt + 1, self._max_retries, delay)
+                    await asyncio.sleep(delay)
+                    continue
+                self._record_error("GBrain MCP server not running")
+                return {"error": "GBrain MCP server not running"}
+
+            async with self._call_lock:
+                self._request_id += 1
+                request = {
+                    "jsonrpc": "2.0",
+                    "id": self._request_id,
+                    "method": "tools/call",
+                    "params": {"name": tool_name, "arguments": arguments},
+                }
+                try:
+                    payload = json.dumps(request) + "\n"
+                    self._proc.stdin.write(payload)
+                    self._proc.stdin.flush()
+                except (BrokenPipeError, OSError) as exc:
+                    logger.warning("GBrain MCP write error (proc dead?): {}", exc)
+                    self._proc = None  # force restart on next attempt
+                    last_result = {"error": f"GBrain subprocess died: {exc}"}
+                    if attempt < self._max_retries - 1:
+                        delay = self._retry_base_delay * (2 ** attempt)
+                        await asyncio.sleep(delay)
+                        continue
+                    break
+                except Exception as exc:
+                    self._record_error(f"GBrain MCP write error: {exc}")
+                    logger.warning(self._last_error)
+                    last_result = {"error": str(exc)}
+                    if attempt < self._max_retries - 1:
+                        delay = self._retry_base_delay * (2 ** attempt)
+                        await asyncio.sleep(delay)
+                        continue
+                    break
+
+                try:
+                    line = await asyncio.wait_for(
+                        asyncio.get_event_loop().run_in_executor(None, self._proc.stdout.readline),
+                        timeout=timeout,
+                    )
+                    if not line:
+                        last_result = {"error": "No response from GBrain MCP server"}
+                        if attempt < self._max_retries - 1:
+                            delay = self._retry_base_delay * (2 ** attempt)
+                            logger.warning("GBrain empty response, retrying ({}/{})", attempt + 1, self._max_retries)
+                            await asyncio.sleep(delay)
+                            continue
+                        break
+
+                    resp = json.loads(line)
+                    if "error" in resp:
+                        err = resp["error"]
+                        last_result = {"error": f"JSON-RPC error {err.get('code', '')}: {err.get('message', '')}"}
+                        if attempt < self._max_retries - 1:
+                            delay = self._retry_base_delay * (2 ** attempt)
+                            logger.warning("GBrain JSON-RPC error, retrying ({}/{})", attempt + 1, self._max_retries)
+                            await asyncio.sleep(delay)
+                            continue
+                        break
+
+                    # Success — unwrap MCP content envelope
+                    self._record_success()
+                    raw_result = resp.get("result", {})
+                    unwrapped = self._unwrap_mcp_result(raw_result)
+                    return unwrapped if isinstance(unwrapped, dict) else {"data": unwrapped}
+
+                except asyncio.TimeoutError:
+                    last_result = {"error": f"timeout after {timeout}s"}
+                    logger.warning("GBrain MCP call {} timed out after {}s (attempt {}/{})", tool_name, timeout, attempt + 1, self._max_retries)
+                    if attempt < self._max_retries - 1:
+                        delay = self._retry_base_delay * (2 ** attempt)
+                        await asyncio.sleep(delay)
+                        continue
+                except json.JSONDecodeError:
+                    last_result = {"error": "Invalid JSON response from GBrain"}
+                    if attempt < self._max_retries - 1:
+                        delay = self._retry_base_delay * (2 ** attempt)
+                        await asyncio.sleep(delay)
+                        continue
+                except Exception as exc:
+                    last_result = {"error": str(exc)}
+                    logger.warning("GBrain MCP call {} error: {}", tool_name, exc)
+                    if attempt < self._max_retries - 1:
+                        delay = self._retry_base_delay * (2 ** attempt)
+                        await asyncio.sleep(delay)
+                        continue
+
+        # All retries exhausted
+        self._record_error(str(last_result.get("error", "unknown")))
+        logger.warning("GBrain MCP call {} failed after {} retries: {}", tool_name, self._max_retries, last_result.get("error"))
+        return last_result
 
     # ── Query methods ────────────────────────────────────────────────
 
@@ -230,19 +350,19 @@ class MemoryAdapter:
         if "error" in result:
             logger.warning("query_experience failed: {}", result["error"])
             return []
-        return result.get("results", result.get("hits", []))
+        return result.get("results", result.get("hits", result.get("data", [])))
 
     async def list_pages(self, type_prefix: str = "", limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
         """List pages by type prefix. Falls back to query_experience if gbrain lacks list_pages tool."""
         result = await self._call_tool("list_pages", {
-            "prefix": type_prefix,
+            "type": type_prefix,
             "limit": limit,
             "offset": offset,
         })
         if "error" in result:
             logger.debug("list_pages tool not available, falling back to query_experience: {}", result["error"])
             return await self.query_experience(f"type:{type_prefix}" if type_prefix else "", timeout=5.0)
-        return result.get("pages", result.get("results", []))
+        return result.get("pages", result.get("results", result.get("data", [])))
 
     async def delete_page(self, slug: str) -> bool:
         """Delete a page by slug. Falls back to writing empty content if gbrain lacks delete_page tool."""
