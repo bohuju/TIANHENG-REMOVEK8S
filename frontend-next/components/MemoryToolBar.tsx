@@ -49,7 +49,7 @@ interface MemoryToolBarProps {
   selectedSlugs: Set<string>;
   results: MemoryResult[];
   onRefresh: () => void;
-  onToast: (toast: { message: string; severity: 'success' | 'error' | 'info' } | null) => void;
+  onToast: (toast: { message: string; severity: 'success' | 'error' | 'info' | 'warning' } | null) => void;
 }
 
 export function MemoryToolBar({

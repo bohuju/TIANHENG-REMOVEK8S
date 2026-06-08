@@ -24,7 +24,7 @@ export default function MemoryPage() {
   const [selectedSlug, setSelectedSlug] = useState<string | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [toast, setToast] = useState<{ message: string; severity: 'success' | 'error' | 'info' } | null>(null);
+  const [toast, setToast] = useState<{ message: string; severity: 'success' | 'error' | 'info' | 'warning' } | null>(null);
 
   const stats = useMemoryStatsQuery();
   const isSearchMode = searchQuery.length > 0;

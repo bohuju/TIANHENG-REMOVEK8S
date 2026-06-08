@@ -30,7 +30,7 @@ interface MemoryPageDrawerProps {
   slug: string | null;
   onClose: () => void;
   onRefresh: () => void;
-  onToast: (toast: { message: string; severity: 'success' | 'error' | 'info' } | null) => void;
+  onToast: (toast: { message: string; severity: 'success' | 'error' | 'info' | 'warning' } | null) => void;
 }
 
 export function MemoryPageDrawer({ open, slug, onClose, onRefresh, onToast }: MemoryPageDrawerProps) {
