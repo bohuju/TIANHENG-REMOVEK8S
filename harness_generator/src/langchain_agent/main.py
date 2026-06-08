@@ -3840,6 +3840,81 @@ async def memory_stats():
     }
 
 
+@app.post("/api/memory/batch-delete")
+async def memory_batch_delete(body: dict = Body(...)):
+    """Delete multiple memory pages in one request."""
+    adapter = getattr(app.state, "memory_adapter", None)
+    if adapter is None:
+        raise HTTPException(status_code=503, detail="Memory service not available")
+
+    slugs = body.get("slugs")
+    if not isinstance(slugs, list) or not slugs:
+        raise HTTPException(status_code=400, detail="slugs must be a non-empty list")
+
+    ok_count = 0
+    failed: dict[str, str] = {}
+    for slug in slugs:
+        try:
+            deleted = await adapter.delete_page(str(slug))
+        except Exception as exc:
+            deleted = False
+            failed[str(slug)] = str(exc)
+        if deleted:
+            ok_count += 1
+        else:
+            failed[str(slug)] = failed.get(str(slug), "delete returned false")
+
+    return {"ok": ok_count, "failed": len(failed), "errors": failed}
+
+
+@app.post("/api/memory/batch-retype")
+async def memory_batch_retype(body: dict = Body(...)):
+    """Reclassify multiple memory pages by updating their frontmatter type."""
+    adapter = getattr(app.state, "memory_adapter", None)
+    if adapter is None:
+        raise HTTPException(status_code=503, detail="Memory service not available")
+
+    changes = body.get("changes")
+    if not isinstance(changes, list) or not changes:
+        raise HTTPException(status_code=400, detail="changes must be a non-empty list")
+
+    ok_count = 0
+    failed: dict[str, str] = {}
+    for ch in changes:
+        slug = str(ch.get("slug", ""))
+        new_type = str(ch.get("new_type", ""))
+        if not slug or not new_type:
+            failed[slug or "(empty)"] = "slug and new_type are required"
+            continue
+        try:
+            page = await adapter.get_page(slug)
+        except Exception as exc:
+            failed[slug] = f"get_page error: {exc}"
+            continue
+        if page is None:
+            failed[slug] = "page not found"
+            continue
+
+        existing_fm = page.get("frontmatter", {})
+        if not isinstance(existing_fm, dict):
+            existing_fm = {}
+        existing_fm["type"] = new_type
+        compiled_truth = page.get("compiled_truth", page.get("content", ""))
+        timeline = page.get("timeline", [])
+
+        try:
+            ok = await adapter.write_page(slug, existing_fm, compiled_truth, timeline)
+        except Exception as exc:
+            ok = False
+            failed[slug] = str(exc)
+        if ok:
+            ok_count += 1
+        else:
+            failed[slug] = failed.get(slug, "write_page returned false")
+
+    return {"ok": ok_count, "failed": len(failed), "errors": failed}
+
+
 @app.get("/api/memory/health")
 async def memory_health():
     """Report GBrain memory service health status.
