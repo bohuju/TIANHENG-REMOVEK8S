@@ -60,7 +60,8 @@ echo "[+] API ready (http://localhost:8000/api/system)"
 
 echo "[*] Starting gbrain memory database..."
 if docker_cmd docker ps -a --format '{{.Names}}' | grep -q '^gbrain-mcp-pg$'; then
-    docker_cmd docker start gbrain-mcp-pg 2>/dev/null || true
+    docker_cmd docker restart gbrain-mcp-pg 2>/dev/null || docker_cmd docker start gbrain-mcp-pg 2>/dev/null || true
+    sleep 2
     docker_cmd docker network connect remove_k8s_default gbrain-mcp-pg 2>/dev/null || true
     echo "[+] gbrain-mcp-pg started and connected to network"
 else
