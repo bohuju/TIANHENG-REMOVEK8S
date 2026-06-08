@@ -107,6 +107,7 @@ export function useMemorySearch(q: string, type: string) {
     queryKey: ['memory', 'search', q, type],
     queryFn: () => searchMemory(q, type || undefined),
     enabled: q.length > 0,
+    staleTime: 30_000,
   });
 }
 
@@ -114,6 +115,7 @@ export function useMemoryPages(type: string) {
   return useQuery({
     queryKey: ['memory', 'pages', type],
     queryFn: () => listMemoryPages(type),
+    staleTime: 30_000,
   });
 }
 
@@ -122,6 +124,7 @@ export function useMemoryPage(slug: string | null) {
     queryKey: ['memory', 'page', slug],
     queryFn: () => getMemoryPage(slug as string),
     enabled: Boolean(slug),
+    staleTime: 30_000,
   });
 }
 
@@ -153,6 +156,7 @@ export function useMemoryStatsQuery() {
   return useQuery({
     queryKey: ['memory', 'stats'],
     queryFn: fetchMemoryStats,
+    staleTime: 30_000,
   });
 }
 
