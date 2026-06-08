@@ -3810,6 +3810,36 @@ async def memory_pages(type: str = "", limit: int = Query(default=50, ge=1, le=2
     }
 
 
+@app.get("/api/memory/stats")
+async def memory_stats():
+    """Return memory page counts grouped by type."""
+    adapter = getattr(app.state, "memory_adapter", None)
+    if adapter is None:
+        return {"enabled": False, "healthy": False, "total": 0, "by_type": {}}
+
+    try:
+        raw = await adapter.list_pages(type_prefix="", limit=500)
+    except Exception as exc:
+        logger.warning("memory_stats error: {}", exc)
+        return {
+            "enabled": True, "healthy": False,
+            "total": 0, "by_type": {}, "error": str(exc),
+        }
+
+    by_type: dict[str, int] = {}
+    for r in raw:
+        slug = r.get("slug", "")
+        key = _page_type_key_from_slug(slug)
+        by_type[key] = by_type.get(key, 0) + 1
+
+    return {
+        "enabled": True,
+        "healthy": adapter.status()["healthy"],
+        "total": sum(by_type.values()),
+        "by_type": by_type,
+    }
+
+
 @app.get("/api/memory/health")
 async def memory_health():
     """Report GBrain memory service health status.
