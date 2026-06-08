@@ -3,7 +3,9 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Alert, Box, Button, Stack, Typography } from '@mui/material';
 import PsychologyIcon from '@mui/icons-material/Psychology';
+import SettingsIcon from '@mui/icons-material/Settings';
 import { MemoryDrawer } from '@/components/MemoryDrawer';
+import { SettingsDrawer } from '@/components/SettingsDrawer';
 import { ConfigPanel } from '@/components/ConfigPanel';
 import { LogPanel } from '@/components/LogPanel';
 import { SessionPanel } from '@/components/SessionPanel';
@@ -39,6 +41,7 @@ export default function HomePage() {
   }, [tasks.data, activeTaskId, setActiveTaskId]);
 
   const [memoryOpen, setMemoryOpen] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   const activeSummary = useMemo(
     () => tasks.data?.find((t) => t.job_id === activeTaskId),
@@ -70,14 +73,24 @@ export default function HomePage() {
               重点视图：任务进度、子任务状态、日志与错误摘要。
             </Typography>
           </Box>
-          <Button
-            variant="outlined"
-            startIcon={<PsychologyIcon />}
-            onClick={() => setMemoryOpen(true)}
-            size="small"
-          >
-            记忆查看
-          </Button>
+          <Box sx={{ display: 'flex', gap: 1 }}>
+            <Button
+              variant="outlined"
+              startIcon={<SettingsIcon />}
+              onClick={() => setSettingsOpen(true)}
+              size="small"
+            >
+              设置
+            </Button>
+            <Button
+              variant="outlined"
+              startIcon={<PsychologyIcon />}
+              onClick={() => setMemoryOpen(true)}
+              size="small"
+            >
+              记忆查看
+            </Button>
+          </Box>
         </Stack>
 
         <SystemOverviewCard
@@ -117,6 +130,7 @@ export default function HomePage() {
           </Box>
         </Stack>
         <MemoryDrawer open={memoryOpen} onClose={() => setMemoryOpen(false)} />
+        <SettingsDrawer open={settingsOpen} onClose={() => setSettingsOpen(false)} />
       </Stack>
     </Box>
   );

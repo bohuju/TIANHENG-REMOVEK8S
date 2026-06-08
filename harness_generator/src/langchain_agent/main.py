@@ -2193,6 +2193,52 @@ def put_config(request: dict = Body(...)):
     return {"ok": True}
 
 
+@app.post("/api/config/test-model")
+def test_model():
+    """Send a minimal chat completion to verify the configured LLM is reachable."""
+    cfg = _cfg_get()
+    api_key = (cfg.openai_api_key or "").strip()
+    base_url = (cfg.openai_base_url or "https://api.deepseek.com/v1").strip().rstrip("/")
+    model = (cfg.openai_model or "deepseek-reasoner").strip()
+
+    if not api_key:
+        raise HTTPException(status_code=400, detail="API key is not configured")
+
+    import urllib.request
+    import urllib.error
+
+    url = f"{base_url}/chat/completions"
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 1,
+        "temperature": 0,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Authorization", f"Bearer {api_key}")
+
+    started = time.monotonic()
+    try:
+        resp = urllib.request.urlopen(req, timeout=15)
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        raw = resp.read().decode("utf-8", errors="replace")
+        data = json.loads(raw)
+        returned_model = data.get("model", model)
+        return {"ok": True, "model": returned_model, "latency_ms": elapsed_ms}
+    except urllib.error.HTTPError as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        try:
+            body_text = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            body_text = ""
+        return {"ok": False, "error": f"HTTP {exc.code}: {body_text or exc.reason}", "latency_ms": elapsed_ms}
+    except Exception as exc:
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        return {"ok": False, "error": str(exc), "latency_ms": elapsed_ms}
+
+
 @app.get("/api/system")
 def get_system_status():
     return _system_status()

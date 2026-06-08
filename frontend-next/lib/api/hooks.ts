@@ -18,6 +18,7 @@ import {
   fetchMemoryStats,
   batchDeleteMemoryPages,
   batchRetypeMemoryPages,
+  testModel,
   type SubmitTaskInput,
 } from './client';
 import type { WebConfig } from './schemas';
@@ -181,5 +182,13 @@ export function useBatchRetypeMemoryMutation() {
       void qc.invalidateQueries({ queryKey: ['memory', 'search'] });
       void qc.invalidateQueries({ queryKey: ['memory', 'stats'] });
     },
+  });
+}
+
+// ── Config test ──
+
+export function useTestModelMutation() {
+  return useMutation({
+    mutationFn: () => testModel(),
   });
 }

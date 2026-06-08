@@ -191,3 +191,9 @@ export async function batchRetypeMemoryPages(changes: { slug: string; new_type: 
   });
   return memoryBatchRetypeResponseSchema.parse(data);
 }
+
+// ── Config test ──
+
+export async function testModel(): Promise<{ ok: boolean; model?: string; latency_ms?: number; error?: string }> {
+  return request('/config/test-model', { method: 'POST' });
+}
