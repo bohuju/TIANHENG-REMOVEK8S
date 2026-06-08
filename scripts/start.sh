@@ -28,7 +28,7 @@ docker_cmd() {
 }
 
 echo "[*] Checking Docker DNS..."
-if ! docker_cmd docker run --rm alpine cat /etc/resolv.conf 2>/dev/null | grep -q 'nameserver'; then
+if ! timeout 10 docker_cmd docker run --rm alpine cat /etc/resolv.conf 2>/dev/null | grep -q 'nameserver'; then
     echo "[!] Docker DNS may be broken. If builds fail, add to /etc/docker/daemon.json:"
     echo '    {"dns": ["8.8.8.8", "1.1.1.1"]}'
     echo "    Then: sudo systemctl restart docker"
