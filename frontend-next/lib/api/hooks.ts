@@ -15,6 +15,9 @@ import {
   getMemoryPage,
   updateMemoryPage,
   deleteMemoryPage,
+  fetchMemoryStats,
+  batchDeleteMemoryPages,
+  batchRetypeMemoryPages,
   type SubmitTaskInput,
 } from './client';
 import type { WebConfig } from './schemas';
@@ -142,6 +145,37 @@ export function useDeleteMemoryPageMutation() {
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: ['memory', 'pages'] });
       void qc.invalidateQueries({ queryKey: ['memory', 'search'] });
+    },
+  });
+}
+
+export function useMemoryStatsQuery() {
+  return useQuery({
+    queryKey: ['memory', 'stats'],
+    queryFn: fetchMemoryStats,
+  });
+}
+
+export function useBatchDeleteMemoryMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (slugs: string[]) => batchDeleteMemoryPages(slugs),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['memory', 'pages'] });
+      void qc.invalidateQueries({ queryKey: ['memory', 'search'] });
+      void qc.invalidateQueries({ queryKey: ['memory', 'stats'] });
+    },
+  });
+}
+
+export function useBatchRetypeMemoryMutation() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (changes: { slug: string; new_type: string }[]) => batchRetypeMemoryPages(changes),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ['memory', 'pages'] });
+      void qc.invalidateQueries({ queryKey: ['memory', 'search'] });
+      void qc.invalidateQueries({ queryKey: ['memory', 'stats'] });
     },
   });
 }

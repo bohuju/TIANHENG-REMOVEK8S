@@ -167,7 +167,30 @@ export const memoryDeleteResponseSchema = z.object({
   slug: z.string(),
 });
 
+export const memoryStatsResponseSchema = z.object({
+  enabled: z.boolean().default(false),
+  healthy: z.boolean().default(false),
+  total: z.number().int().default(0),
+  by_type: z.record(z.string(), z.number().int()).default({}),
+  error: z.string().optional(),
+});
+
+export const memoryBatchDeleteResponseSchema = z.object({
+  ok: z.number().int().default(0),
+  failed: z.number().int().default(0),
+  errors: z.record(z.string(), z.string()).default({}),
+});
+
+export const memoryBatchRetypeResponseSchema = z.object({
+  ok: z.number().int().default(0),
+  failed: z.number().int().default(0),
+  errors: z.record(z.string(), z.string()).default({}),
+});
+
 export type MemoryResult = z.infer<typeof memoryResultSchema>;
 export type MemorySearchResponse = z.infer<typeof memorySearchResponseSchema>;
 export type MemoryPagesResponse = z.infer<typeof memoryPagesResponseSchema>;
 export type MemoryPageResponse = z.infer<typeof memoryPageResponseSchema>;
+export type MemoryStatsResponse = z.infer<typeof memoryStatsResponseSchema>;
+export type MemoryBatchDeleteResponse = z.infer<typeof memoryBatchDeleteResponseSchema>;
+export type MemoryBatchRetypeResponse = z.infer<typeof memoryBatchRetypeResponseSchema>;

@@ -8,6 +8,9 @@ import {
   memoryPageResponseSchema,
   memoryUpdateResponseSchema,
   memoryDeleteResponseSchema,
+  memoryStatsResponseSchema,
+  memoryBatchDeleteResponseSchema,
+  memoryBatchRetypeResponseSchema,
   type WebConfig,
   type SystemStatus,
   type TaskDetail,
@@ -15,6 +18,7 @@ import {
   type MemorySearchResponse,
   type MemoryPagesResponse,
   type MemoryPageResponse,
+  type MemoryStatsResponse,
 } from './schemas';
 
 const API_BASE = (process.env.NEXT_PUBLIC_API_BASE || '/api').replace(/\/$/, '');
@@ -165,4 +169,25 @@ export async function deleteMemoryPage(slug: string): Promise<{ ok: boolean; slu
     method: 'DELETE',
   });
   return memoryDeleteResponseSchema.parse(data);
+}
+
+export async function fetchMemoryStats(): Promise<MemoryStatsResponse> {
+  const data = await request<unknown>('/memory/stats');
+  return memoryStatsResponseSchema.parse(data);
+}
+
+export async function batchDeleteMemoryPages(slugs: string[]): Promise<{ ok: number; failed: number; errors: Record<string, string> }> {
+  const data = await request<unknown>('/memory/batch-delete', {
+    method: 'POST',
+    body: JSON.stringify({ slugs }),
+  });
+  return memoryBatchDeleteResponseSchema.parse(data);
+}
+
+export async function batchRetypeMemoryPages(changes: { slug: string; new_type: string }[]): Promise<{ ok: number; failed: number; errors: Record<string, string> }> {
+  const data = await request<unknown>('/memory/batch-retype', {
+    method: 'POST',
+    body: JSON.stringify({ changes }),
+  });
+  return memoryBatchRetypeResponseSchema.parse(data);
 }
