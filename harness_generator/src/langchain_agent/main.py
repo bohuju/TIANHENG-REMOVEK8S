@@ -131,12 +131,23 @@ _SENSITIVE_ENV_KEYS = (
 )
 
 _MEMORY_TYPE_PREFIX: dict[str, str] = {
-    "targets": "fuzz/targets",
-    "sessions": "fuzz/sessions",
-    "crashes": "fuzz/crashes",
-    "strategies": "fuzz/strategies",
-    "harnesses": "fuzz/harnesses",
+    "targets": "fuzz/target-repo",
+    "sessions": "fuzz/session",
+    "crashes": "fuzz/crash",
+    "strategies": "fuzz/strategy",
+    "harnesses": "fuzz/harness",
 }
+
+from memory.schemas import PAGE_TYPE_PREFIX
+
+def _page_type_key_from_slug(slug: str) -> str:
+    """Determine the memory type key from a page slug."""
+    for page_type, slug_prefix in PAGE_TYPE_PREFIX.items():
+        if slug.startswith(slug_prefix + "/"):
+            for key, pt in _MEMORY_TYPE_PREFIX.items():
+                if pt == page_type:
+                    return key
+    return "unknown"
 
 _SENSITIVE_KV_RE = re.compile(
     r"(?i)\b([A-Z0-9_]*(?:API[_-]?KEY|TOKEN|SECRET|PASSWORD|PASS))\s*=\s*([^\s,;]+)"
@@ -573,6 +584,48 @@ def _ensure_job_logs_dir() -> None:
 
 def _job_log_path(job_id: str) -> Path:
     return _JOB_LOGS_DIR / f"{job_id}.log"
+
+
+def _delete_job_files(job_id: str) -> None:
+    """Delete all filesystem artifacts for a job.
+
+    Covers:
+    - Log file:   _JOB_LOGS_DIR / {job_id}.log
+    - Stage dir:  _JOB_LOGS_DIR / {job_id}/
+    - Output dir: SHERPA_OUTPUT_DIR / _jobs / {job_id}/
+    """
+    jid = str(job_id or "").strip()
+    if not jid:
+        return
+    # Guard against accidental traversal: only delete if the leaf name matches
+    # the job_id exactly (no ".." or slashes).
+    if jid != Path(jid).name or jid in (".", ".."):
+        logger.warning("Refusing to delete job files for suspicious job_id: {}", jid)
+        return
+
+    _delete_dir_safe(_JOB_LOGS_DIR / jid, f"job stage dir for {jid}")
+    _delete_file_safe(_JOB_LOGS_DIR / f"{jid}.log", f"job log for {jid}")
+
+    base = Path(os.environ.get("SHERPA_OUTPUT_DIR", "/shared/output")).expanduser()
+    _delete_dir_safe(base / "_jobs" / jid, f"job output dir for {jid}")
+
+
+def _delete_file_safe(path: Path, label: str) -> None:
+    try:
+        if path.is_file() or path.is_symlink():
+            path.unlink()
+            logger.info("Deleted {}: {}", label, path)
+    except OSError as exc:
+        logger.warning("Failed to delete {} ({}): {}", label, path, exc)
+
+
+def _delete_dir_safe(path: Path, label: str) -> None:
+    try:
+        if path.is_dir():
+            shutil.rmtree(path, ignore_errors=False)
+            logger.info("Deleted {}: {}", label, path)
+    except OSError as exc:
+        logger.warning("Failed to delete {} ({}): {}", label, path, exc)
 
 
 def _read_log_tail(path: Path, *, max_chars: int) -> str:
@@ -3640,27 +3693,39 @@ def list_tasks(limit: int = 50):
 
 @app.delete("/api/task/{job_id}")
 def delete_task(job_id: str):
-    """Delete a task and all its child jobs from memory and persistent store."""
+    """Delete a task and all its child jobs from memory, persistent store, and disk."""
     with _JOBS_LOCK:
         if job_id not in _JOBS:
             raise HTTPException(status_code=404, detail=f"Task not found: {job_id}")
         snap = dict(_JOBS[job_id])
+        # Collect child job IDs before removing parent
+        child_ids = list(snap.get("children") or [])
+        # Remove parent and all children from in-memory store
         del _JOBS[job_id]
+        for cid in child_ids:
+            if cid in _JOBS:
+                del _JOBS[cid]
 
-    # Cancel running future if any
+    # Cancel running futures for parent and children
     with _JOB_FUTURES_LOCK:
-        future = _JOB_FUTURES.pop(job_id, None)
-    if future is not None and not future.done():
-        future.cancel()
+        for jid in [job_id] + child_ids:
+            future = _JOB_FUTURES.pop(jid, None)
+            if future is not None and not future.done():
+                future.cancel()
 
     # Remove from persistent store (best-effort)
     if _JOB_STORE is not None:
-        try:
-            _JOB_STORE.delete_job(job_id)
-        except Exception as exc:
-            logger.warning("Failed to delete job {} from persistent store: {}", job_id, exc)
+        for jid in [job_id] + child_ids:
+            try:
+                _JOB_STORE.delete_job(jid)
+            except Exception as exc:
+                logger.warning("Failed to delete job {} from persistent store: {}", jid, exc)
 
-    logger.info("Task {} deleted (kind={})", job_id, snap.get("kind", ""))
+    # Delete all filesystem artifacts for parent and children
+    for jid in [job_id] + child_ids:
+        _delete_job_files(jid)
+
+    logger.info("Task {} deleted (kind={}, children={})", job_id, snap.get("kind", ""), len(child_ids))
     return {"ok": True, "job_id": job_id}
 
 
@@ -3697,11 +3762,7 @@ async def memory_search(q: str = "", type: str = ""):
     results = []
     for r in raw:
         slug = r.get("slug", "")
-        page_type = "unknown"
-        for key, prefix in _MEMORY_TYPE_PREFIX.items():
-            if slug.startswith(prefix + "/"):
-                page_type = key
-                break
+        page_type = _page_type_key_from_slug(slug)
         results.append({
             "slug": slug,
             "type": page_type,
@@ -3717,26 +3778,54 @@ async def memory_pages(type: str = "", limit: int = Query(default=50, ge=1, le=2
     """List memory pages by type."""
     adapter = getattr(app.state, "memory_adapter", None)
     if adapter is None:
-        return {"enabled": False, "results": [], "total": 0}
+        return {"enabled": False, "healthy": False, "status": {}, "results": [], "total": 0}
 
     prefix = _MEMORY_TYPE_PREFIX.get(type, "")
     try:
         raw = await adapter.list_pages(type_prefix=prefix, limit=limit, offset=offset)
     except Exception as exc:
         logger.warning("memory_pages error: {}", exc)
-        return {"enabled": True, "results": [], "total": 0, "error": str(exc)}
+        return {
+            "enabled": True, "healthy": False, "status": adapter.status(),
+            "results": [], "total": 0, "error": str(exc),
+        }
 
     results = []
     for r in raw:
         slug = r.get("slug", "")
+        page_type = _page_type_key_from_slug(slug)
         results.append({
             "slug": slug,
-            "type": type or "unknown",
+            "type": page_type,
             "title": r.get("title", slug.rsplit("/", 1)[-1] if "/" in slug else slug),
             "score": 0.0,
             "snippet": r.get("summary", r.get("snippet", "")),
         })
-    return {"enabled": True, "results": results, "total": len(results)}
+    return {
+        "enabled": True,
+        "healthy": adapter.status()["healthy"],
+        "status": adapter.status(),
+        "results": results,
+        "total": len(results),
+    }
+
+
+@app.get("/api/memory/health")
+async def memory_health():
+    """Report GBrain memory service health status.
+
+    Triggers lazy gbrain startup on first call so the reported health
+    reflects the actual state rather than \"never tried\".
+    """
+    adapter = getattr(app.state, "memory_adapter", None)
+    if adapter is None:
+        return {"enabled": False, "healthy": False, "status": {}}
+    # Trigger lazy startup if gbrain hasn't been started yet
+    await adapter._ensure_running()
+    return {
+        "enabled": True,
+        **adapter.status(),
+    }
 
 
 @app.get("/api/memory/page/{slug:path}")
