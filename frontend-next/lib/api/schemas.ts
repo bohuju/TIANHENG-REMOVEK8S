@@ -140,6 +140,8 @@ export const memoryResultSchema = z.object({
 
 export const memorySearchResponseSchema = z.object({
   enabled: z.boolean().default(false),
+  healthy: z.boolean().optional(),
+  status: z.any().optional(),
   results: z.array(memoryResultSchema).default([]),
   total: z.number().int().default(0),
   error: z.string().optional(),
@@ -147,6 +149,8 @@ export const memorySearchResponseSchema = z.object({
 
 export const memoryPagesResponseSchema = z.object({
   enabled: z.boolean().default(false),
+  healthy: z.boolean().optional(),
+  status: z.any().optional(),
   results: z.array(memoryResultSchema).default([]),
   total: z.number().int().default(0),
   error: z.string().optional(),
