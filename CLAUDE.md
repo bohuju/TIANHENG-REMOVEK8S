@@ -86,13 +86,6 @@ MemoryAdapter (memory_adapter.py)
 - **Image**: gbrain + Bun baked into Docker image via `Dockerfile.web` (COPY gbrain, bun install)
 - **Key env**: `GBRAIN_DATABASE_URL` takes precedence over config file
 
-**Important**: The gbrain database container (`gbrain-mcp-pg`) is managed externally. After `docker compose up -d`, it must be reconnected:
-
-```bash
-sg docker -c "docker start gbrain-mcp-pg"
-sg docker -c "docker network connect remove_k8s_default gbrain-mcp-pg"
-```
-
 Verify: `curl -s http://localhost:8000/api/memory/health` → `healthy: true`
 
 ## Key environment variables

@@ -751,6 +751,28 @@ def _is_truthy_env(name: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "on"}
 
 
+def _docker_cli_inline_native(args: list[str], *, timeout: int = 20) -> tuple[int, str, str]:
+    """Minimal inline docker CLI runner for container pool management.
+
+    Runs ``docker <args>`` on the host (dind daemon) without going through
+    the generator's ``_dockerize_cmd`` / ``_run_cmd`` machinery, avoiding
+    infinite recursion when those same methods call back into the pool.
+    """
+    try:
+        proc = subprocess.run(
+            ["docker", *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+        return int(proc.returncode), proc.stdout or "", proc.stderr or ""
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, "", str(exc)
+
+
 def _run_cmd_capture(
     cmd: Sequence[str],
     *,
@@ -1603,6 +1625,11 @@ class NonOssFuzzHarnessGenerator:
             self.docker_image, self._dockerfile_path = self._resolve_docker_image(self.docker_image)
             self._ensure_docker_image(self.docker_image, dockerfile=self._dockerfile_path)
 
+        # Pooled persistent container for docker exec reuse.
+        # When set, _dockerize_cmd uses `docker exec` instead of `docker run --rm`,
+        # reducing container churn from ~1-per-command to ~1-per-stage.
+        self._pool_container_id: Optional[str] = None
+
         self._ensure_fuzz_dirs()
 
         git_docker_image = self.docker_image if self.docker_image else None
@@ -1957,7 +1984,82 @@ class NonOssFuzzHarnessGenerator:
         # When executing build/run inside Docker, use the container's python.
         return "python3" if self.docker_image else sys.executable
 
-    def _dockerize_cmd(self, cmd: Sequence[str], *, cwd: Path, env: Optional[Dict[str, str]]) -> List[str]:
+    # ------------------------------------------------------------------
+    # Persistent container pooling
+    # ------------------------------------------------------------------
+
+    def _ensure_pool_container(self) -> str:
+        """Return the ID of a persistent container for ``docker exec`` reuse.
+
+        The first call starts a long-lived container (``sleep 86400``);
+        subsequent calls return the same container ID.  This replaces the
+        per-command ``docker run --rm`` pattern and reduces container churn
+        from ~N-per-stage to 1-per-stage.
+        """
+        if self._pool_container_id:
+            # Verify the container is still alive.
+            rc, _, _ = _docker_cli_inline_native(
+                ["inspect", "-f", "{{.State.Running}}", self._pool_container_id],
+                timeout=10,
+            )
+            if rc == 0:
+                return self._pool_container_id
+            # Container died or was removed; create a fresh one.
+            self._pool_container_id = None
+
+        container_name = f"sherpa-pool-{uuid.uuid4().hex[:8]}"
+        mount_src = str(self.repo_root.resolve())
+
+        start_cmd: List[str] = [
+            "docker", "run", "-d", "--name", container_name,
+            "--label", f"sherpa.repo_root={Path(mount_src).name}",
+            "--label", f"sherpa.repo_root_sha1={hashlib.sha1(mount_src.encode('utf-8', errors='ignore')).hexdigest()}",
+            "-v", f"{mount_src}:/work",
+            "-w", "/work",
+            self.docker_image,
+            "sleep", "86400",
+        ]
+        try:
+            rc, out, err = _docker_cli_inline_native(start_cmd, timeout=30)
+        except Exception as exc:
+            raise HarnessGeneratorError(
+                f"Failed to start persistent container for docker exec pooling: {exc}"
+            ) from exc
+        if rc != 0:
+            tail = (err or out or "").strip()[-500:]
+            raise HarnessGeneratorError(
+                f"Failed to start persistent container (rc={rc}): {tail}"
+            )
+        self._pool_container_id = container_name
+        return container_name
+
+    def teardown_pool_container(self) -> None:
+        """Stop and remove the persistent pool container, if any."""
+        cid = self._pool_container_id
+        self._pool_container_id = None
+        if cid:
+            try:
+                _docker_cli_inline_native(["rm", "-f", cid], timeout=20)
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Command dockerize
+    # ------------------------------------------------------------------
+
+    def _dockerize_cmd(self, cmd: Sequence[str], *, cwd: Path, env: Optional[Dict[str, str]],
+                       disable_pool: bool = False) -> List[str]:
+        """Wrap *cmd* for execution inside the fuzz-runtime Docker image.
+
+        When ``disable_pool=False`` (default), commands are dispatched via
+        ``docker exec`` into a single persistent container that lives for the
+        duration of the stage, reducing container churn from ~1-per-command
+        to ~1-per-stage.
+
+        When ``disable_pool=True`` (e.g. parallel fuzzer runs), each call
+        produces a classic ``docker run --rm`` so every fuzzer gets its own
+        cgroup / resource limits.
+        """
         if not self.docker_image:
             return list(cmd)
 
@@ -2085,32 +2187,12 @@ class NonOssFuzzHarnessGenerator:
         rel = "." if rel in (".", "") else rel.replace("\\", "/")
         workdir_in_container = "/work" if rel == "." else f"/work/{rel}"
 
-        docker_cmd: List[str] = [
-            "docker",
-            "run",
-            "--rm",
-            "--name",
-            _docker_container_name(mount_src, cmd),
-            "--label",
-            f"sherpa.repo_root={Path(mount_src).name}",
-            "--label",
-            f"sherpa.repo_root_sha1={hashlib.sha1(mount_src.encode('utf-8', errors='ignore')).hexdigest()}",
-            "-v",
-            f"{mount_src}:/work",
-            "-w",
-            workdir_in_container,
-        ]
-
         filtered_env = _filter_env(env)
         if "CC" not in filtered_env:
             filtered_env["CC"] = "clang"
         if "CXX" not in filtered_env:
             filtered_env["CXX"] = "clang++"
-        if filtered_env:
-            for k, v in filtered_env.items():
-                docker_cmd += ["-e", f"{k}={v}"]
 
-        # Default: translate all args for container.
         translated_for_exec = [_translate_arg(a) for a in cmd]
         dep_rel = (FUZZ_SYSTEM_PACKAGES_FILE or "fuzz/system_packages.txt").replace("\\", "/").strip("/")
         translated_cmd = self._wrap_exec_with_runtime_prelude(
@@ -2119,7 +2201,42 @@ class NonOssFuzzHarnessGenerator:
             dep_log_prefix="docker/deps",
         )
 
-        docker_cmd.append(self.docker_image)
+        if disable_pool:
+            # ── One-shot: docker run --rm (parallel fuzzers, resource isolation) ──
+            docker_cmd: List[str] = [
+                "docker",
+                "run",
+                "--rm",
+                "--name",
+                _docker_container_name(mount_src, cmd),
+                "--label",
+                f"sherpa.repo_root={Path(mount_src).name}",
+                "--label",
+                f"sherpa.repo_root_sha1={hashlib.sha1(mount_src.encode('utf-8', errors='ignore')).hexdigest()}",
+                "-v",
+                f"{mount_src}:/work",
+                "-w",
+                workdir_in_container,
+            ]
+            if filtered_env:
+                for k, v in filtered_env.items():
+                    docker_cmd += ["-e", f"{k}={v}"]
+            docker_cmd.append(self.docker_image)
+            docker_cmd += translated_cmd
+            return docker_cmd
+
+        # ── Pooled: docker exec into persistent container ──
+        pool_cid = self._ensure_pool_container()
+        docker_cmd: List[str] = [
+            "docker",
+            "exec",
+            "-w",
+            workdir_in_container,
+        ]
+        if filtered_env:
+            for k, v in filtered_env.items():
+                docker_cmd += ["-e", f"{k}={v}"]
+        docker_cmd.append(pool_cid)
         docker_cmd += translated_cmd
         return docker_cmd
 
@@ -6458,7 +6575,10 @@ EOF
             self._sanitize_build_py_for_non_root_install()
         dep_rel = (FUZZ_SYSTEM_PACKAGES_FILE or "fuzz/system_packages.txt").replace("\\", "/").strip("/")
         if self.docker_image:
-            actual_cmd = self._dockerize_cmd(exec_args, cwd=cwd, env=effective_env)
+            # Parallel fuzzer runs need separate containers for cgroup isolation;
+            # all other commands reuse a single pooled container via docker exec.
+            actual_cmd = self._dockerize_cmd(exec_args, cwd=cwd, env=effective_env,
+                                             disable_pool=track_for_early_stop)
         else:
             actual_cmd = self._wrap_exec_with_runtime_prelude(
                 exec_args,

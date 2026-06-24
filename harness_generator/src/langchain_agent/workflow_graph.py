@@ -24,6 +24,12 @@ from persistent_config import load_config
 
 import workflow_common as _wf_common
 import workflow_summary as _wf_summary
+from workflow_common import (
+    cleanup_old_output_dirs,
+    enforce_output_quota,
+    prune_dind_resources,
+    _stop_runtime_containers_for_repo_root,
+)
 from workflow_context_store import (
     context_dir_for_repo_root,
     merge_result_into_contexts,
@@ -5045,6 +5051,15 @@ def _node_init(state: FuzzWorkflowState) -> FuzzWorkflowRuntimeState:
         dep_ok, dep_err = _check_promefuzz_runtime_deps()
         if not dep_ok:
             raise RuntimeError(f"init prerequisite failed: {dep_err}")
+
+    # ── Disk quota admission control ──
+    # Enforce disk quota before allocating a new workdir
+    try:
+        enforce_output_quota()
+    except RuntimeError as quota_err:
+        raise RuntimeError(
+            f"Disk quota check failed for repo {repo_url}: {quota_err}"
+        ) from quota_err
 
     raw_resume_repo_root = (state.get("resume_repo_root") or "").strip()
     workdir: Path | None = None
@@ -12700,6 +12715,17 @@ def _route_after_build_state(state: FuzzWorkflowRuntimeState) -> str:
     err = dict(state.get("error") or {})
     if not _has_error_payload(err):
         return "run"
+    # Targeted retry: source/harness errors → fix the harness directly;
+    # only infrastructure errors or unknown go through full replan.
+    build_error_kind = str(state.get("build_error_kind") or "").strip()
+    if build_error_kind == "source":
+        return "synthesize"
+    # "unknown" errors could be harness-related; try synthesize first,
+    # fall back to plan if same error repeats (tracked via same_build_error_repeats).
+    if build_error_kind in ("", "unknown"):
+        repeats = int(state.get("same_build_error_repeats") or 0)
+        if repeats < 2:
+            return "synthesize"
     return "plan"
 
 
@@ -12772,7 +12798,8 @@ def _route_after_improve_harness_state(state: FuzzWorkflowRuntimeState) -> str:
     if bool(state.get("coverage_should_improve")):
         if str(state.get("coverage_improve_mode") or "").strip() == "in_place":
             return "build"
-        return "plan"
+        # Harness needs structural changes → go to synthesize, not full replan
+        return "synthesize"
     return "stop"
 
 
@@ -12832,9 +12859,15 @@ def _route_after_crash_triage_state(state: FuzzWorkflowRuntimeState) -> str:
         return "plan"
     label = _normalize_crash_triage_label(str(state.get("crash_triage_label") or ""))
     if label == "harness_bug":
-        return "plan"
+        # Harness bug: fix the harness directly via synthesize, no need to replan
+        return "synthesize"
     if label == "upstream_bug":
         return "re-build"
+    # For unknown/unclassified labels, try synthesize before full replan
+    if label in ("", "unknown", "uncertain"):
+        repeats = int(state.get("same_crash_repeats") or 0)
+        if repeats < 2:
+            return "synthesize"
     return "plan"
 
 
@@ -12880,7 +12913,8 @@ def _route_after_re_run_state(state: FuzzWorkflowRuntimeState) -> str:
             return "stop"
         return "plan"
     if bool(state.get("crash_repro_done")) and not bool(state.get("crash_repro_ok")):
-        return "plan"
+        # Crash reproduction failed: likely harness issue → fix harness
+        return "synthesize"
     if bool(state.get("crash_repro_done")) and bool(state.get("crash_repro_ok")):
         return "crash-analysis"
     return "stop"
@@ -12895,7 +12929,8 @@ def _route_after_crash_analysis_state(state: FuzzWorkflowRuntimeState) -> str:
         return "plan"
     verdict = _normalize_crash_analysis_verdict(str(state.get("crash_analysis_verdict") or ""))
     if verdict == "false_positive":
-        return "plan"
+        # False positive: harness triggers crash incorrectly → fix harness
+        return "synthesize"
     return "stop"
 
 
@@ -13102,7 +13137,7 @@ def build_fuzz_workflow() -> StateGraph:
     graph.add_conditional_edges(
         "build",
         _route_after_build,
-        {"run": "run", "plan": "plan", "stop": END},
+        {"run": "run", "plan": "plan", "synthesize": "synthesize", "stop": END},
     )
     graph.add_conditional_edges(
         "run",
@@ -13117,7 +13152,7 @@ def build_fuzz_workflow() -> StateGraph:
     graph.add_conditional_edges(
         "crash-triage",
         _route_after_crash_triage,
-        {"re-build": "re-build", "plan": "plan", "stop": END},
+        {"re-build": "re-build", "plan": "plan", "synthesize": "synthesize", "stop": END},
     )
     graph.add_conditional_edges(
         "coverage-analysis",
@@ -13127,7 +13162,7 @@ def build_fuzz_workflow() -> StateGraph:
     graph.add_conditional_edges(
         "improve-harness",
         _route_after_improve_harness,
-        {"plan": "plan", "stop": END},
+        {"plan": "plan", "synthesize": "synthesize", "stop": END},
     )
     graph.add_conditional_edges(
         "re-build",
@@ -13137,12 +13172,12 @@ def build_fuzz_workflow() -> StateGraph:
     graph.add_conditional_edges(
         "re-run",
         _route_after_re_run,
-        {"crash-analysis": "crash-analysis", "plan": "plan", "stop": END},
+        {"crash-analysis": "crash-analysis", "plan": "plan", "synthesize": "synthesize", "stop": END},
     )
     graph.add_conditional_edges(
         "crash-analysis",
         _route_after_crash_analysis,
-        {"plan": "plan", "stop": "memory-summarize"},
+        {"plan": "plan", "synthesize": "synthesize", "stop": "memory-summarize"},
     )
     graph.add_edge("memory-summarize", END)
     return graph
@@ -13166,6 +13201,59 @@ def _collect_fuzz_inventory(repo_root: Path) -> dict[str, Any]:
 
 def _write_run_summary(out: dict[str, Any]) -> None:
     _wf_summary.write_run_summary(out)
+
+
+def _run_workflow_cleanup(repo_root: str, *, job_id: str = "") -> None:
+    """Best-effort resource cleanup after each workflow invocation.
+
+    Called inline after ``wf.invoke()`` returns (before error checking),
+    so cleanup always runs regardless of whether the workflow succeeded,
+    failed, or raised.
+
+    This function NEVER raises — all exceptions are swallowed so that
+    cleanup failures cannot mask the real workflow result.
+    """
+    # 1. Stop any remaining Docker containers for this repo
+    if repo_root:
+        try:
+            killed = _stop_runtime_containers_for_repo_root(repo_root)
+            if killed:
+                _wf_log(
+                    None,
+                    f"cleanup: stopped {len(killed)} runtime container(s) for "
+                    f"repo_root={repo_root}",
+                )
+        except Exception:
+            pass
+
+    # 2. Lightweight dind resource prune (dangling images + expired build cache)
+    try:
+        img_removed, builder_freed = prune_dind_resources(
+            image_until="1h",
+            builder_until="1h",
+        )
+        if img_removed > 0 or builder_freed > 0:
+            _wf_log(
+                None,
+                f"cleanup: pruned {img_removed} dangling image(s), "
+                f"freed {builder_freed / 1024**2:.0f} MB build cache inside dind",
+            )
+    except Exception:
+        pass
+
+    # 3. Periodic output directory cleanup (probabilistic, ~1/5 runs)
+    try:
+        # Use a lightweight hash-based trigger to avoid scanning on every job
+        if sum(ord(c) for c in (job_id or "")) % 5 == 0:
+            deleted, freed = cleanup_old_output_dirs()
+            if deleted > 0:
+                _wf_log(
+                    None,
+                    f"cleanup: removed {deleted} old output dir(s), "
+                    f"freed ~{freed / 1024**2:.0f} MB",
+                )
+    except Exception:
+        pass
 
 
 def run_fuzz_workflow(inp: FuzzWorkflowInput) -> dict[str, Any]:
@@ -13239,8 +13327,21 @@ def run_fuzz_workflow(inp: FuzzWorkflowInput) -> dict[str, Any]:
         ),
         "max_steps": max_steps,
     }
+    # ── Workflow execution ──
     raw: Any = wf.invoke(invoke_payload)
     out = _normalize_error_state(cast(dict[str, Any], raw) if isinstance(raw, dict) else {})
+    repo_root_for_cleanup = str(out.get("repo_root") or "")
+
+    # ── Per-job resource cleanup (best-effort, never blocks completion) ──
+    _run_workflow_cleanup(repo_root_for_cleanup, job_id=job_id)
+
+    # ── Teardown pooled Docker container ──
+    gen = out.get("generator")
+    if gen is not None and hasattr(gen, "teardown_pool_container"):
+        try:
+            gen.teardown_pool_container()
+        except Exception:
+            pass
     final_context_dir = str(context_dir_for_repo_root(out.get("repo_root")) or resolved_context_dir).strip()
     if final_context_dir:
         current_control_doc, current_workflow_doc = read_context_docs(

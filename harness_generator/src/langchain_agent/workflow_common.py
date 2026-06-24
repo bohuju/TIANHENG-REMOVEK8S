@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import time
 import uuid
 from functools import lru_cache
@@ -375,6 +377,347 @@ def alloc_output_workdir(repo_url: str) -> Path | None:
     base.mkdir(parents=True, exist_ok=True)
     slug = slug_from_repo_url(repo_url)
     return base / f"{slug}-{uuid.uuid4().hex[:8]}"
+
+
+# ---------------------------------------------------------------------------
+# Disk quota & cleanup helpers
+# ---------------------------------------------------------------------------
+
+def _output_root() -> Path | None:
+    out_root = os.environ.get("SHERPA_OUTPUT_DIR", "").strip()
+    if not out_root:
+        return None
+    return Path(out_root).expanduser().resolve()
+
+
+def _get_output_dir_mtime(d: Path) -> float:
+    try:
+        return d.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def cleanup_old_output_dirs(
+    *,
+    retention_days: int | None = None,
+    max_dirs: int | None = None,
+    max_total_bytes: int | None = None,
+    dry_run: bool = False,
+) -> tuple[int, int]:
+    """Delete old output directories in ``SHERPA_OUTPUT_DIR``.
+
+    Returns ``(deleted_count, freed_bytes)``.
+    """
+    root = _output_root()
+    if root is None or not root.is_dir():
+        return 0, 0
+
+    if retention_days is None:
+        try:
+            retention_days = int(os.environ.get("SHERPA_OUTPUT_RETENTION_DAYS", "7"))
+        except (ValueError, TypeError):
+            retention_days = 7
+    if max_dirs is None:
+        try:
+            max_dirs = int(os.environ.get("SHERPA_OUTPUT_MAX_DIRS", "0"))
+        except (ValueError, TypeError):
+            max_dirs = 0
+    if max_total_bytes is None:
+        try:
+            max_total_gb = float(os.environ.get("SHERPA_OUTPUT_MAX_SIZE_GB", "0"))
+            max_total_bytes = int(max_total_gb * 1024**3) if max_total_gb > 0 else 0
+        except (ValueError, TypeError):
+            max_total_bytes = 0
+
+    # Collect directories with mtime and size
+    entries: list[tuple[Path, float, int]] = []
+    try:
+        for p in root.iterdir():
+            if not p.is_dir():
+                continue
+            try:
+                mtime = _get_output_dir_mtime(p)
+                # Fast size estimate: sum of st_size for top-level files only
+                size = 0
+                try:
+                    for child in p.iterdir():
+                        try:
+                            if child.is_file():
+                                size += child.stat().st_size
+                            elif child.is_dir():
+                                # One level deeper for dirs like "fuzz", "build"
+                                try:
+                                    for sub in child.iterdir():
+                                        try:
+                                            size += sub.stat().st_size
+                                        except OSError:
+                                            pass
+                                except OSError:
+                                    pass
+                        except OSError:
+                            pass
+                except OSError:
+                    pass
+                entries.append((p, mtime, size))
+            except OSError:
+                pass
+    except OSError:
+        return 0, 0
+
+    if not entries:
+        return 0, 0
+
+    now = time.time()
+    cutoff = now - retention_days * 86400
+    to_delete: set[Path] = set()
+
+    # TTL-based: delete dirs older than retention_days
+    for p, mtime, _size in entries:
+        if mtime > 0 and mtime < cutoff:
+            to_delete.add(p)
+
+    # Count-based: keep only the most recent max_dirs
+    if max_dirs > 0:
+        entries_by_mtime = sorted(entries, key=lambda x: x[1], reverse=True)
+        for p, _mtime, _size in entries_by_mtime[max_dirs:]:
+            to_delete.add(p)
+
+    # Size-based: delete oldest until under max_total_bytes
+    if max_total_bytes > 0:
+        total = sum(sz for _p, _mt, sz in entries)
+        if total > max_total_bytes:
+            entries_by_mtime = sorted(entries, key=lambda x: x[1])
+            for p, _mtime, sz in entries_by_mtime:
+                if total <= max_total_bytes:
+                    break
+                to_delete.add(p)
+                total -= sz
+
+    deleted_count = 0
+    freed_bytes = 0
+    for p in to_delete:
+        if dry_run:
+            deleted_count += 1
+            continue
+        try:
+            # Estimate freed bytes before deletion (coarse)
+            est = 0
+            try:
+                est = sum(
+                    f.stat().st_size
+                    for f in p.rglob("*")
+                    if f.is_file()
+                )
+            except OSError:
+                pass
+            shutil.rmtree(p, ignore_errors=True)
+            deleted_count += 1
+            freed_bytes += est
+        except OSError:
+            pass
+
+    return deleted_count, freed_bytes
+
+
+def enforce_output_quota(
+    *,
+    min_free_bytes: int | None = None,
+    max_total_bytes: int | None = None,
+) -> None:
+    """Check disk quota before starting a new job.
+
+    Raises ``RuntimeError`` if disk is critically low even after cleanup.
+    """
+    if min_free_bytes is None:
+        try:
+            min_free_gb = float(os.environ.get("SHERPA_OUTPUT_MIN_FREE_GB", "5"))
+            min_free_bytes = int(min_free_gb * 1024**3)
+        except (ValueError, TypeError):
+            min_free_bytes = 5 * 1024**3
+    if max_total_bytes is None:
+        try:
+            max_total_gb = float(os.environ.get("SHERPA_OUTPUT_MAX_SIZE_GB", "50"))
+            max_total_bytes = int(max_total_gb * 1024**3) if max_total_gb > 0 else 0
+        except (ValueError, TypeError):
+            max_total_bytes = 50 * 1024**3
+
+    root = _output_root()
+    if root is None:
+        return  # No output dir configured, skip quota enforcement
+
+    # Check free space on the filesystem
+    try:
+        usage = shutil.disk_usage(str(root))
+        free_bytes = usage.free
+    except OSError:
+        return  # Can't check, skip
+
+    # If free space is critically low, do an aggressive age-based cleanup first
+    if free_bytes < min_free_bytes:
+        cleanup_old_output_dirs(retention_days=1, max_dirs=0, max_total_bytes=0)
+
+        # Re-check free space
+        try:
+            usage = shutil.disk_usage(str(root))
+            free_bytes = usage.free
+        except OSError:
+            pass
+
+    # If still critically low, do size-based cleanup
+    if free_bytes < min_free_bytes and max_total_bytes > 0:
+        cleanup_old_output_dirs(retention_days=0, max_dirs=0, max_total_bytes=max_total_bytes)
+
+        try:
+            usage = shutil.disk_usage(str(root))
+            free_bytes = usage.free
+        except OSError:
+            pass
+
+    if free_bytes < min_free_bytes:
+        raise RuntimeError(
+            f"Output disk quota exceeded: only {free_bytes / 1024**3:.1f} GB free "
+            f"(minimum: {min_free_bytes / 1024**3:.1f} GB). "
+            f"Please free disk space or adjust SHERPA_OUTPUT_MIN_FREE_GB."
+        )
+
+
+def prune_dind_resources(
+    *,
+    image_until: str = "2h",
+    builder_until: str = "2h",
+) -> tuple[int, int]:
+    """Prune dangling Docker images and build cache inside the dind daemon.
+
+    Returns ``(images_pruned_count, builder_pruned_bytes)``.
+
+    This is safe to call from any workflow stage — it only removes
+    *dangling* images (no tag) and expired build cache.
+    """
+    images_removed = 0
+    builder_freed = 0
+
+    # Prune dangling images (images with <none>:<none> tag)
+    try:
+        proc = subprocess.run(
+            [
+                "docker", "image", "prune", "--force",
+                "--filter", f"until={image_until}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
+        for line in (proc.stdout or "").splitlines():
+            if "Total reclaimed space:" in line:
+                # Parse the size from docker output
+                import re as _re
+                m = _re.search(r"Total reclaimed space:\s*([\d.]+[GMk]?B)", line)
+                if m:
+                    pass  # size is informational
+        if proc.returncode == 0:
+            # Count removed images from output lines like "deleted: sha256:..."
+            images_removed = (proc.stdout or "").count("deleted:")
+    except Exception:
+        pass
+
+    # Prune build cache
+    try:
+        proc = subprocess.run(
+            [
+                "docker", "builder", "prune", "--force",
+                "--filter", f"until={builder_until}",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            timeout=120,
+            check=False,
+        )
+        if proc.returncode == 0:
+            for line in (proc.stdout or "").splitlines():
+                if "Total:" in line:
+                    import re as _re
+                    m = _re.search(r"Total:\s*([\d.]+[GMk]?B)", line)
+                    if m:
+                        val = m.group(1)
+                        try:
+                            if val.endswith("GB"):
+                                builder_freed = int(float(val[:-2]) * 1024**3)
+                            elif val.endswith("MB"):
+                                builder_freed = int(float(val[:-2]) * 1024**2)
+                            elif val.endswith("kB"):
+                                builder_freed = int(float(val[:-2]) * 1024)
+                            elif val.endswith("B"):
+                                builder_freed = int(float(val[:-1]))
+                        except (ValueError, TypeError):
+                            pass
+    except Exception:
+        pass
+
+    return images_removed, builder_freed
+
+
+def _stop_runtime_containers_for_repo_root(repo_root: str) -> list[str]:
+    """Stop (rm -f) all Docker containers associated with a repo root directory.
+
+    Returns list of killed container IDs.
+    """
+    root = str(repo_root or "").strip()
+    if not root:
+        return []
+
+    repo_sha1 = hashlib.sha1(root.encode("utf-8", errors="ignore")).hexdigest()
+    killed: list[str] = []
+
+    # Find containers by label or volume mount
+    for filter_cmd in (
+        ["ps", "-q", "--filter", f"label=sherpa.repo_root_sha1={repo_sha1}"],
+        ["ps", "-q", "--filter", f"volume={root}"],
+    ):
+        try:
+            proc = subprocess.run(
+                ["docker", *filter_cmd],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                errors="replace",
+                timeout=15,
+                check=False,
+            )
+            for line in (proc.stdout or "").splitlines():
+                cid = line.strip()
+                if cid:
+                    try:
+                        rc, _, _ = _docker_cli_inline(["rm", "-f", cid], timeout=20)
+                        if rc == 0:
+                            killed.append(cid)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    return killed
+
+
+def _docker_cli_inline(args: list[str], *, timeout: int = 20) -> tuple[int, str, str]:
+    """Minimal inline docker CLI runner (avoids circular import from main.py)."""
+    try:
+        proc = subprocess.run(
+            ["docker", *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            errors="replace",
+            timeout=timeout,
+            check=False,
+        )
+        return int(proc.returncode), proc.stdout or "", proc.stderr or ""
+    except (OSError, subprocess.SubprocessError) as e:
+        return 1, "", str(e)
 
 
 def enter_step(state: dict[str, Any], step_name: str) -> tuple[dict[str, Any], bool]:

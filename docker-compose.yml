@@ -80,7 +80,7 @@ services:
       OPENCODE_CONFIG: "/tmp/sherpa-runtime/opencode.generated.json"
       SHERPA_WEB_JOB_LOG_DIR: "/app/job-logs/jobs"
       DATABASE_URL: ${DATABASE_URL:-postgresql://sherpa:sherpa@postgres:5432/sherpa}
-      GBRAIN_DATABASE_URL: ${GBRAIN_DATABASE_URL:-postgresql://postgres:postgres@gbrain-mcp-pg:5432/gbrain_mcp}
+      GBRAIN_DATABASE_URL: ${GBRAIN_DATABASE_URL:-postgresql://postgres:postgres@gbrain-postgres:5432/gbrain_mcp}
 
       # Optional (fuzz patching): where to read API key env file from.
       # AI_KEY_PATH: "/app/.env"
