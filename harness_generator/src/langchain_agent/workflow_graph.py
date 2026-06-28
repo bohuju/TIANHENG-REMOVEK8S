@@ -5024,6 +5024,15 @@ def _check_promefuzz_runtime_deps() -> tuple[bool, str]:
 def _node_init(state: FuzzWorkflowState) -> FuzzWorkflowRuntimeState:
     t0 = time.perf_counter()
     _wf_log(cast(dict[str, Any], state), "-> init")
+
+    # ── Cancel check before any expensive operations ──
+    try:
+        from fuzz_unharnessed_repo import is_cancel_requested as _is_cancelled
+        if _is_cancelled():
+            raise RuntimeError("cancelled by user")
+    except ImportError:
+        pass
+
     repo_url = (state.get("repo_url") or "").strip()
     if not repo_url:
         raise ValueError("repo_url is required")
@@ -13328,6 +13337,14 @@ def run_fuzz_workflow(inp: FuzzWorkflowInput) -> dict[str, Any]:
         "max_steps": max_steps,
     }
     # ── Workflow execution ──
+    # Cancel check before entering the potentially long-running graph
+    try:
+        from fuzz_unharnessed_repo import is_cancel_requested as _is_cancelled
+        if _is_cancelled():
+            raise RuntimeError("cancelled by user")
+    except ImportError:
+        pass
+
     raw: Any = wf.invoke(invoke_payload)
     out = _normalize_error_state(cast(dict[str, Any], raw) if isinstance(raw, dict) else {})
     repo_root_for_cleanup = str(out.get("repo_root") or "")

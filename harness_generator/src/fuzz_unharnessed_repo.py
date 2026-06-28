@@ -71,6 +71,38 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 from urllib.parse import urlparse
 from dotenv import load_dotenv
 
+# ---------------------------------------------------------------------------
+# Cross-module cancel tracking
+# ---------------------------------------------------------------------------
+# The API layer (main.py) adds a job_id to ``_PENDING_CANCELLATIONS`` when
+# the user clicks "stop".  Long-running operations in this module check
+# ``is_cancel_requested()`` periodically and abort with a clean error so
+# the workflow unwinds and resources are released.
+_PENDING_CANCELLATIONS: set[str] = set()
+_PENDING_CANCEL_LOCK = threading.Lock()
+
+
+def request_cancel(job_id: str) -> None:
+    """Signal that *job_id* should be cancelled at the next check."""
+    with _PENDING_CANCEL_LOCK:
+        _PENDING_CANCELLATIONS.add(str(job_id))
+
+
+def is_cancel_requested(job_id: str | None = None) -> bool:
+    """Return True if the given (or current) job has been cancelled."""
+    jid = str(job_id or "").strip() or os.environ.get("SHERPA_CURRENT_JOB_ID", "") or os.environ.get("SHERPA_JOB_ID", "")
+    if not jid:
+        return False
+    with _PENDING_CANCEL_LOCK:
+        return jid in _PENDING_CANCELLATIONS
+
+
+def clear_cancel(job_id: str) -> None:
+    """Remove the cancel signal for *job_id* (called after cleanup)."""
+    with _PENDING_CANCEL_LOCK:
+        _PENDING_CANCELLATIONS.discard(str(job_id))
+
+
 try:
     from git import Repo, exc as git_exc  # type: ignore
 except Exception:  # pragma: no cover
@@ -6588,6 +6620,11 @@ EOF
 
         start_ts = time.time()
         start_mono = time.monotonic()
+
+        # ── Cancel check before spawning subprocess ──
+        if is_cancel_requested():
+            raise HarnessGeneratorError("cancelled by user")
+
         print(f"[*] ➜  {' '.join(_redact_cmd(actual_cmd))}", flush=True)
         proc = subprocess.Popen(
             actual_cmd,
@@ -6669,6 +6706,12 @@ EOF
 
                 if idle_timeout > 0 and (time.monotonic() - last_activity) > idle_timeout:
                     idle_timed_out = True
+                    timed_out = True
+                    break
+
+                # ── Cancel check during long-running commands ──
+                if is_cancel_requested():
+                    print("[*] cancel requested — terminating subprocess", flush=True)
                     timed_out = True
                     break
 

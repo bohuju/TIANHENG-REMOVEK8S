@@ -2873,6 +2873,9 @@ def _run_fuzz_job(
             filter=lambda record, tid=current_thread_id: record["thread"].id == tid,
         )
         logger.info(f"[job {job_id}] start repo={request.code_url} resumed={int(resumed)} trigger={trigger}")
+        # ── Set job ID in environment so sub-modules can check cancel signals ──
+        os.environ["SHERPA_CURRENT_JOB_ID"] = str(job_id)
+        os.environ["SHERPA_JOB_ID"] = str(job_id)
         if _is_cancel_requested(job_id):
             raise RuntimeError(cancel_error)
         logger.info(f"[job {job_id}] about to dispatch worker...")
@@ -3284,6 +3287,11 @@ def _run_fuzz_job(
             last_resume_finished_at=time.time() if resumed else None,
         )
     finally:
+        # ── Clean up job-scoped environment variables ──
+        if os.environ.get("SHERPA_CURRENT_JOB_ID") == str(job_id):
+            os.environ.pop("SHERPA_CURRENT_JOB_ID", None)
+        if os.environ.get("SHERPA_JOB_ID") == str(job_id):
+            os.environ.pop("SHERPA_JOB_ID", None)
         if log_sink_id is not None:
             try:
                 logger.remove(log_sink_id)
@@ -3456,9 +3464,56 @@ def _stop_fuzz_job(job_id: str, *, reason: str, trigger: str) -> dict[str, objec
         recoverable=False,
     )
 
+    # ── Signal the running fuzz logic to abort at its next check ──
+    try:
+        from fuzz_unharnessed_repo import request_cancel as _signal_cancel
+        _signal_cancel(job_id)
+    except Exception:
+        pass
+
+    # ── Kill the OpenCode subprocess if one is running for this job ──
+    try:
+        from codex_helper import kill_opencode_for_job as _kill_opencode
+        _kill_opencode(job_id)
+    except Exception:
+        pass
+
     future_cancelled = _cancel_job_future(job_id)
     repo_root = str(snap.get("workflow_repo_root") or snap.get("resume_repo_root") or "").strip()
+
+    # ── Kill running Docker containers for this repo ──
     killed_containers = _stop_runtime_containers_for_repo(repo_root) if repo_root else []
+    # Also kill any pooled containers related to this job
+    try:
+        rc, out, _ = _docker_cli(["ps", "-q", "--filter", f"name=sherpa-pool-"], timeout=10)
+        if rc == 0:
+            for cid in out.splitlines():
+                cid = cid.strip()
+                if cid:
+                    _docker_cli(["rm", "-f", cid], timeout=15)
+                    killed_containers.append(cid)
+    except Exception:
+        pass
+
+    # ── Delete the job's output workdir ──
+    cleaned_workdir = False
+    if repo_root:
+        try:
+            root_path = Path(repo_root).expanduser().resolve()
+            if root_path.exists():
+                shutil.rmtree(str(root_path), ignore_errors=True)
+                cleaned_workdir = True
+                logger.info(f"[job {job_id}] cleaned workdir: {root_path}")
+        except Exception:
+            pass
+
+    # ── Clear the cancel signal after cleanup ──
+    try:
+        from fuzz_unharnessed_repo import clear_cancel as _clear_cancel
+        _clear_cancel(job_id)
+    except Exception:
+        pass
+
     if status not in {"success", "resumed", "error", "resume_failed"}:
         _job_update(
             job_id,
@@ -3477,6 +3532,7 @@ def _stop_fuzz_job(job_id: str, *, reason: str, trigger: str) -> dict[str, objec
         "future_cancelled": bool(future_cancelled),
         "killed_containers": killed_containers,
         "repo_root": repo_root or None,
+        "cleaned_workdir": cleaned_workdir,
     }
 
 
@@ -3495,6 +3551,21 @@ def _stop_task_job(job_id: str, *, reason: str, trigger: str) -> dict[str, objec
         last_cancel_reason=trigger,
         recoverable=False,
     )
+
+    # ── Signal the running task logic to abort ──
+    try:
+        from fuzz_unharnessed_repo import request_cancel as _signal_cancel
+        _signal_cancel(job_id)
+    except Exception:
+        pass
+
+    # ── Kill the OpenCode subprocess if one is running ──
+    try:
+        from codex_helper import kill_opencode_for_job as _kill_opencode
+        _kill_opencode(job_id)
+    except Exception:
+        pass
+
     parent_future_cancelled = _cancel_job_future(job_id)
 
     child_ids = [str(x) for x in (snap.get("children") or []) if str(x).strip()]
@@ -3744,10 +3815,19 @@ def delete_task(job_id: str):
         if job_id not in _JOBS:
             raise HTTPException(status_code=404, detail=f"Task not found: {job_id}")
         snap = dict(_JOBS[job_id])
-        # Collect child job IDs before removing parent
         child_ids = list(snap.get("children") or [])
-        # Remove parent and all children from in-memory store
-        del _JOBS[job_id]
+
+    # ── Stop all running children first (kills containers, cleans workdirs) ──
+    kind = str(snap.get("kind") or "")
+    if kind == "task":
+        _stop_task_job(job_id, reason="deleted by user", trigger="manual_delete")
+    else:
+        _stop_fuzz_job(job_id, reason="deleted by user", trigger="manual_delete")
+
+    # Remove from memory store
+    with _JOBS_LOCK:
+        if job_id in _JOBS:
+            del _JOBS[job_id]
         for cid in child_ids:
             if cid in _JOBS:
                 del _JOBS[cid]

@@ -763,6 +763,54 @@ def _ensure_git_repo(path: Path) -> "Repo":
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Cross-module OpenCode process tracking (used by cancel / stop)
+# ---------------------------------------------------------------------------
+_active_opencode_procs: dict[str, subprocess.Popen] = {}
+_active_opencode_lock = threading.Lock()
+
+
+def register_opencode_process(job_id: str, proc: subprocess.Popen) -> None:
+    with _active_opencode_lock:
+        _active_opencode_procs[str(job_id)] = proc
+
+
+def unregister_opencode_process(job_id: str) -> None:
+    with _active_opencode_lock:
+        _active_opencode_procs.pop(str(job_id), None)
+
+
+def kill_opencode_for_job(job_id: str) -> bool:
+    """Terminate the OpenCode subprocess for *job_id* if it is running.
+
+    Returns True if a process was found and terminated.
+    """
+    jid = str(job_id)
+    with _active_opencode_lock:
+        proc = _active_opencode_procs.get(jid)
+    if proc is None:
+        return False
+    try:
+        if proc.poll() is None:
+            # Send SIGTERM to the entire process group (OpenCode may spawn children)
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    proc.kill()
+                proc.wait(timeout=3)
+    except Exception:
+        pass
+    unregister_opencode_process(jid)
+    return True
+
+
 class CodexHelper:
     """Wrapper around OpenCode CLI with robust retry logic.
 
@@ -1385,6 +1433,9 @@ class CodexHelper:
                         errors="replace",
                         start_new_session=(os.name != "nt"),
                     )
+                    # Register for cross-module cancellation
+                    if job_id:
+                        register_opencode_process(job_id, proc)
                 except FileNotFoundError as e:
                     raise FileNotFoundError(
                         f"Failed to launch OpenCode CLI: {cli_exe} (cwd={self.working_dir}). "
@@ -1683,6 +1734,9 @@ class CodexHelper:
                         if proc.poll() is not None and out_q.empty():
                             break
                 finally:
+                    # Unregister the OpenCode process (may already be dead)
+                    if job_id:
+                        unregister_opencode_process(job_id)
                     # Drain any remaining buffered output.
                     try:
                         while True:
